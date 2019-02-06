@@ -1,0 +1,13 @@
+[package]
+name = "dump_ciede2000"
+version = "0.1.0"
+authors = ["Kyle Siefring <kylesiefring@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+y4m = "0.3"
+clap = {version = "2", default-features = false}
+delta_e = {path = "../DeltaE"}
+
+[profile.release]
+debug = true
