@@ -7,7 +7,8 @@ edition = "2018"
 [dependencies]
 y4m = "0.3"
 clap = {version = "2", default-features = false}
-delta_e = {path = "../DeltaE"}
+#delta_e = {path = "../DeltaE"}
+delta_e = { git = "https://github.com/KyleSiefring/DeltaE", branch = "dump_ciede2000" }
 
 [profile.release]
 debug = true
