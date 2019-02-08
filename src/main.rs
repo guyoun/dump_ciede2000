@@ -1,5 +1,9 @@
 extern crate clap;
 
+#[macro_use]
+extern crate itertools;
+use itertools::Itertools;
+
 use clap::{App, Arg, ArgMatches};
 use std::fs::File;
 use std::io::prelude::*;
@@ -98,45 +102,28 @@ fn main() {
                 for i in 0..height {
                     match bytewidth {
                         1 => {
-                            let y_row1 = &y_plane1[i * width..];
-                            let u_row1 = &u_plane1[(i >> 1) * (width >> 1)..];
-                            let v_row1 = &v_plane1[(i >> 1) * (width >> 1)..];
-                            let y_row2 = &y_plane2[i * width..];
-                            let u_row2 = &u_plane2[(i >> 1) * (width >> 1)..];
-                            let v_row2 = &v_plane2[(i >> 1) * (width >> 1)..];
-                            for j in 0..width {
-                                let yuv_to_rgb = |y: f32, u: f32, v: f32| {
-                                    let y = (y - 16.) * (1. / 219.);
-                                    let u = (u - 128.) * (1. / 224.);
-                                    let v = (v - 128.) * (1. / 224.);
-
-                                    let r = y + 1.28033 * v;
-                                    let g = y - 0.21482 * u - 0.38059 * v;
-                                    let b = y + 2.12798 * u;
-
-                                    (r, g, b)
-                                };
-
-                                let (r1, g1, b1) = yuv_to_rgb(
-                                    y_row1[j] as f32,
-                                    u_row1[j >> 1] as f32,
-                                    v_row1[j >> 1] as f32,
-                                );
-                                let (r2, g2, b2) = yuv_to_rgb(
-                                    y_row2[j] as f32,
-                                    u_row2[j >> 1] as f32,
-                                    v_row2[j >> 1] as f32,
-                                );
-                                delta_e_vec[i * width + j] = DE2000::from_rgb_f32(
-                                    &[r1, g1, b1],
-                                    &[r2, g2, b2],
-                                );
-                            }
+                            delta_e_row(
+                                FrameRow {
+                                    y: &y_plane1[i * width..][..width],
+                                    u: &u_plane1[(i >> 1) * (width >> 1)..][..width >> 1],
+                                    v: &v_plane1[(i >> 1) * (width >> 1)..][..width >> 1],
+                                },
+                                FrameRow {
+                                    y: &y_plane2[i * width..][..width],
+                                    u: &u_plane2[(i >> 1) * (width >> 1)..][..width >> 1],
+                                    v: &v_plane2[(i >> 1) * (width >> 1)..][..width >> 1],
+                                },
+                                &mut delta_e_vec[i * width..][..width],
+                            );
                         }
                         _ => {}
                     }
                 }
-                let score = 45. - 20. * (delta_e_vec.iter().map(|x| *x as f64).sum::<f64>() / ((width * height) as f64)).log10();
+                let score = 45.
+                    - 20.
+                        * (delta_e_vec.iter().map(|x| *x as f64).sum::<f64>()
+                            / ((width * height) as f64))
+                            .log10();
                 println!("{:08}: {:2.4}", num_frames, score);
                 total += score;
                 num_frames += 1;
@@ -147,4 +134,141 @@ fn main() {
         }
     }
     println!("Total: {:2.4}", total / (num_frames as f64));
+}
+
+struct FrameRow<'a> {
+    y: &'a [u8],
+    u: &'a [u8],
+    v: &'a [u8],
+}
+
+fn delta_e_row(row1: FrameRow, row2: FrameRow, res_row: &mut [f32]) {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { delta_e_row_avx2(row1, row2, res_row) };
+        }
+    }
+    delta_e_row_scalar(row1, row2, res_row);
+}
+
+fn delta_e_row_scalar(row1: FrameRow, row2: FrameRow, res_row: &mut [f32]) {
+    for (y1, u1, v1, y2, u2, v2, res) in izip!(
+        row1.y,
+        row1.u.iter().interleave(row1.u.iter()),
+        row1.v.iter().interleave(row1.v.iter()),
+        row2.y,
+        row2.u.iter().interleave(row2.u.iter()),
+        row2.v.iter().interleave(row2.v.iter()),
+        res_row
+    ) {
+        let yuv_to_rgb = |y: f32, u: f32, v: f32| {
+            let y = (y - 16.) * (1. / 219.);
+            let u = (u - 128.) * (1. / 224.);
+            let v = (v - 128.) * (1. / 224.);
+
+            let r = y + 1.28033 * v;
+            let g = y - 0.21482 * u - 0.38059 * v;
+            let b = y + 2.12798 * u;
+
+            (r, g, b)
+        };
+
+        let (r1, g1, b1) = yuv_to_rgb(*y1 as f32, *u1 as f32, *v1 as f32);
+        let (r2, g2, b2) = yuv_to_rgb(*y2 as f32, *u2 as f32, *v2 as f32);
+        *res = DE2000::from_rgb_f32(&[r1, g1, b1], &[r2, g2, b2]);
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn delta_e_row_avx2(row1: FrameRow, row2: FrameRow, res_row: &mut [f32]) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    for (chunk1_y, chunk1_u, chunk1_v, chunk2_y, chunk2_u, chunk2_v, res_chunk) in izip!(
+        row1.y.chunks(8),
+        row1.u.chunks(4),
+        row1.v.chunks(4),
+        row2.y.chunks(8),
+        row2.u.chunks(4),
+        row2.v.chunks(4),
+        res_row.chunks_mut(8)
+    ) {
+        if chunk1_y.len() == 8 {
+            #[target_feature(enable = "avx2")]
+            unsafe fn load_luma(chunk: &[u8]) -> __m256 {
+                let tmp = _mm_loadl_epi64(chunk.as_ptr() as *const _);
+                _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(tmp))
+            };
+
+            #[target_feature(enable = "avx2")]
+            unsafe fn load_chroma(chunk: &[u8]) -> __m256 {
+                let tmp = _mm_cvtsi32_si128(*(chunk.as_ptr() as *const i32));
+                _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_unpacklo_epi8(tmp, tmp)))
+            };
+
+            #[target_feature(enable = "avx2")]
+            unsafe fn yuv_to_rgb(y: __m256, u: __m256, v: __m256) -> (__m256, __m256, __m256) {
+                #[target_feature(enable = "avx2")]
+                unsafe fn set1(val: f32) -> __m256 {
+                    _mm256_set1_ps(val)
+                };
+                let y = _mm256_mul_ps(_mm256_sub_ps(y, set1(16.)), set1(1. / 219.));
+                let u = _mm256_mul_ps(_mm256_sub_ps(u, set1(128.)), set1(1. / 224.));
+                let v = _mm256_mul_ps(_mm256_sub_ps(v, set1(128.)), set1(1. / 224.));
+
+                let r = _mm256_add_ps(y, _mm256_mul_ps(v, set1(1.28033)));
+                let g = _mm256_add_ps(
+                    _mm256_add_ps(y, _mm256_mul_ps(u, set1(-0.21482))),
+                    _mm256_mul_ps(v, set1(-0.38059)),
+                );
+                let b = _mm256_add_ps(y, _mm256_mul_ps(u, set1(2.12798)));
+
+                (r, g, b)
+            };
+
+            let (r1, g1, b1) = yuv_to_rgb(
+                load_luma(chunk1_y),
+                load_chroma(chunk1_u),
+                load_chroma(chunk1_v),
+            );
+            let (r2, g2, b2) = yuv_to_rgb(
+                load_luma(chunk2_y),
+                load_chroma(chunk2_u),
+                load_chroma(chunk2_v),
+            );
+
+            #[target_feature(enable = "avx2")]
+            unsafe fn to_array(reg: __m256) -> [f32; 8] {
+                std::mem::transmute(reg)
+            };
+            let r1 = to_array(r1);
+            let g1 = to_array(g1);
+            let b1 = to_array(b1);
+            let r2 = to_array(r2);
+            let g2 = to_array(g2);
+            let b2 = to_array(b2);
+
+            for i in 0..8 {
+                res_chunk[i] = DE2000::from_rgb_f32(&[r1[i], g1[i], b1[i]], &[r2[i], g2[i], b2[i]]);
+            }
+        } else {
+            delta_e_row_scalar(
+                FrameRow {
+                    y: chunk1_y,
+                    u: chunk1_u,
+                    v: chunk1_v,
+                },
+                FrameRow {
+                    y: chunk2_y,
+                    u: chunk2_u,
+                    v: chunk2_v,
+                },
+                res_chunk,
+            );
+        }
+    }
 }

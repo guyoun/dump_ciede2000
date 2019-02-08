@@ -9,6 +9,7 @@ y4m = "0.3"
 clap = {version = "2", default-features = false}
 #delta_e = {path = "../DeltaE"}
 delta_e = { git = "https://github.com/KyleSiefring/DeltaE", branch = "dump_ciede2000" }
+itertools = "0.8.0"
 
 [profile.release]
 debug = true
