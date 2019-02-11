@@ -38,6 +38,9 @@ use std::process::exit;
 
 use delta_e::*;
 
+mod rgbtolab;
+use rgbtolab::*;
+
 pub struct CliOptions {
     pub input1: Box<dyn Read>,
     pub input2: Box<dyn Read>,
@@ -202,7 +205,7 @@ fn delta_e_row_scalar(row1: FrameRow, row2: FrameRow, res_row: &mut [f32]) {
 
         let (r1, g1, b1) = yuv_to_rgb(*y1 as f32, *u1 as f32, *v1 as f32);
         let (r2, g2, b2) = yuv_to_rgb(*y2 as f32, *u2 as f32, *v2 as f32);
-        *res = DE2000::from_rgb_f32(&[r1, g1, b1], &[r2, g2, b2]);
+        *res = DE2000::new(rgb_to_lab(&[r1, g1, b1]), rgb_to_lab(&[r2, g2, b2]));
     }
 }
 
@@ -279,7 +282,10 @@ unsafe fn delta_e_row_avx2(row1: FrameRow, row2: FrameRow, res_row: &mut [f32]) 
             let b2 = to_array(b2);
 
             for i in 0..8 {
-                res_chunk[i] = DE2000::from_rgb_f32(&[r1[i], g1[i], b1[i]], &[r2[i], g2[i], b2[i]]);
+                res_chunk[i] = DE2000::new(
+                    rgb_to_lab(&[r1[i], g1[i], b1[i]]),
+                    rgb_to_lab(&[r2[i], g2[i], b2[i]]),
+                );
             }
         } else {
             delta_e_row_scalar(
