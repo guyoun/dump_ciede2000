@@ -36,10 +36,11 @@ use std::io::prelude::*;
 
 use std::process::exit;
 
-use delta_e::*;
-
 mod rgbtolab;
 use rgbtolab::*;
+
+mod delta_e;
+use delta_e::*;
 
 pub struct CliOptions {
     pub input1: Box<dyn Read>,
