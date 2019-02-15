@@ -271,22 +271,10 @@ unsafe fn delta_e_row_avx2(row1: FrameRow, row2: FrameRow, res_row: &mut [f32]) 
                 load_chroma(chunk2_v),
             );
 
-            #[target_feature(enable = "avx2")]
-            unsafe fn to_array(reg: __m256) -> [f32; 8] {
-                std::mem::transmute(reg)
-            };
-            let r1 = to_array(r1);
-            let g1 = to_array(g1);
-            let b1 = to_array(b1);
-            let r2 = to_array(r2);
-            let g2 = to_array(g2);
-            let b2 = to_array(b2);
-
+            let lab1 = rgb_to_lab_avx2(&[r1, g1, b1]);
+            let lab2 = rgb_to_lab_avx2(&[r2, g2, b2]);
             for i in 0..8 {
-                res_chunk[i] = DE2000::new(
-                    rgb_to_lab(&[r1[i], g1[i], b1[i]]),
-                    rgb_to_lab(&[r2[i], g2[i], b2[i]]),
-                );
+                res_chunk[i] = DE2000::new(lab1[i], lab2[i]);
             }
         } else {
             delta_e_row_scalar(

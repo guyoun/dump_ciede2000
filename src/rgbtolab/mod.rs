@@ -29,10 +29,10 @@ fn rgb_to_xyz_map(c: f32) -> f32 {
     if c > 10. / 255. {
         const A: f32 = 0.055;
         const D: f32 = 1.0 / 1.055;
-        pow_2_4((c as f32 + A) * D)
+        pow_2_4((c + A) * D)
     } else {
         const D: f32 = 1.0 / 12.92;
-        c as f32 * D
+        c * D
     }
 }
 
@@ -63,7 +63,7 @@ fn pow_2_4(x: f32) -> f32 {
     // possible. Calculate the power of 2.4 using the binomial method. Multiply what was divided to
     // the power of 2.4.
 
-    // Lookup table still have to be hardcoded.
+    // Lookup tables still have to be hardcoded.
     const FRAC_BITS: u32 = 3;
 
     // Cast x into an integer to manipulate its exponent and fractional parts into indexes for
@@ -134,5 +134,174 @@ fn pow_2_4(x: f32) -> f32 {
     // Plenty of precision.
     let est = 7. / 125. - 36. / 125. * x + 126. / 125. * x.powi(2) + 28. / 125. * x.powi(3);
 
-    est * truncated_pow_2_4 * exp_pow_2_4
+    est * (truncated_pow_2_4 * exp_pow_2_4)
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub use self::avx2::*;
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+mod avx2 {
+    use super::*;
+
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    macro_rules! sum_mult_avx {
+        (($init:expr), $(($vec:expr, $mul:expr)),* ) => {
+            {
+                let mut sum = _mm256_set1_ps($init);
+                $(
+                    sum = _mm256_add_ps(sum, _mm256_mul_ps($vec, _mm256_set1_ps($mul)));
+                )*
+                sum
+            }
+        };
+        ( $(($vec:expr, $mul:expr)),* ) => {
+            sum_mult_avx!((0.0), $(($vec, $mul)),*);
+        };
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn rgb_to_lab_avx2(rgb: &[__m256; 3]) -> [Lab; 8] {
+        //xyz_to_lab_avx2(rgb_to_xyz_avx2(rgb))
+        let xyz = rgb_to_xyz_avx2(rgb);
+        #[target_feature(enable = "avx2")]
+        unsafe fn to_array(reg: __m256) -> [f32; 8] {
+            std::mem::transmute(reg)
+        }
+        let x = to_array(xyz[0]);
+        let y = to_array(xyz[1]);
+        let z = to_array(xyz[2]);
+
+        let mut output = [Lab {
+            l: 0.,
+            a: 0.,
+            b: 0.,
+        }; 8];
+        for i in 0..8 {
+            output[i] = xyz_to_lab([x[i], y[i], z[i]]);
+        }
+        output
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn rgb_to_xyz_avx2(rgb: &[__m256; 3]) -> [__m256; 3] {
+        let r = rgb_to_xyz_map_avx2(rgb[0]);
+        let g = rgb_to_xyz_map_avx2(rgb[1]);
+        let b = rgb_to_xyz_map_avx2(rgb[2]);
+
+        let x = sum_mult_avx!(
+            (r, 0.4124564390896921),
+            (g, 0.357576077643909),
+            (b, 0.18043748326639894)
+        );
+        let y = sum_mult_avx!(
+            (r, 0.21267285140562248),
+            (g, 0.715152155287818),
+            (b, 0.07217499330655958)
+        );
+        let z = sum_mult_avx!(
+            (r, 0.019333895582329317),
+            (g, 0.119192025881303),
+            (b, 0.9503040785363677)
+        );
+
+        [x, y, z]
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn rgb_to_xyz_map_avx2(c: __m256) -> __m256 {
+        let low = _mm256_mul_ps(c, _mm256_set1_ps(1.0 / 12.92));
+        let hi = pow_2_4_avx2(_mm256_mul_ps(
+            _mm256_add_ps(c, _mm256_set1_ps(0.055)),
+            _mm256_set1_ps(1.0 / 1.055),
+        ));
+        let select = _mm256_cmp_ps(c, _mm256_set1_ps(10. / 255.), _CMP_GT_OS);
+        _mm256_blendv_ps(low, hi, select)
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn pow_2_4_avx2(x: __m256) -> __m256 {
+        // See non-avx2 version
+
+        const FRAC_BITS: u32 = 3;
+
+        let bits = _mm256_castps_si256(x);
+
+        let log2_index =
+            _mm256_add_epi32(_mm256_srli_epi32(bits, 23), _mm256_set1_epi32(-0x7f + 4));
+
+        let lookup_entry_exp_pow_2_4 =
+            |log2: i32| (f32::from_bits(((log2 + 0x7f) << 23) as u32) as f64).powf(2.4) as f32;
+        let lookup_table_exp_pow_2_4 = _mm256_setr_ps(
+            lookup_entry_exp_pow_2_4(-4),
+            lookup_entry_exp_pow_2_4(-3),
+            lookup_entry_exp_pow_2_4(-2),
+            lookup_entry_exp_pow_2_4(-1),
+            lookup_entry_exp_pow_2_4(0),
+            lookup_entry_exp_pow_2_4(1),
+            lookup_entry_exp_pow_2_4(2),
+            lookup_entry_exp_pow_2_4(3),
+        );
+
+        let exp_pow_2_4 = _mm256_permutevar8x32_ps(lookup_table_exp_pow_2_4, log2_index);
+
+        let x = _mm256_or_ps(
+            _mm256_and_ps(
+                x,
+                _mm256_castsi256_ps(_mm256_set1_epi32(0x807fffffu32 as i32)),
+            ),
+            _mm256_castsi256_ps(_mm256_set1_epi32(0x3f800000)),
+        );
+
+        let lookup_entry_inv_truncated = |fraction: i32| {
+            let truncated = 1.0 + (fraction as f64 + 0.5) / ((1 << FRAC_BITS) as f64);
+            (1.0 / truncated) as f32
+        };
+        let lookup_table_inv_truncated = _mm256_setr_ps(
+            lookup_entry_inv_truncated(0),
+            lookup_entry_inv_truncated(1),
+            lookup_entry_inv_truncated(2),
+            lookup_entry_inv_truncated(3),
+            lookup_entry_inv_truncated(4),
+            lookup_entry_inv_truncated(5),
+            lookup_entry_inv_truncated(6),
+            lookup_entry_inv_truncated(7),
+        );
+        let lookup_entry_truncated_pow_2_4 =
+            |fraction: i32| (lookup_entry_inv_truncated(fraction) as f64).powf(-2.4) as f32;
+        let lookup_table_truncated_pow_2_4 = _mm256_setr_ps(
+            lookup_entry_truncated_pow_2_4(0),
+            lookup_entry_truncated_pow_2_4(1),
+            lookup_entry_truncated_pow_2_4(2),
+            lookup_entry_truncated_pow_2_4(3),
+            lookup_entry_truncated_pow_2_4(4),
+            lookup_entry_truncated_pow_2_4(5),
+            lookup_entry_truncated_pow_2_4(6),
+            lookup_entry_truncated_pow_2_4(7),
+        );
+
+        // No reason to mask the higher bits
+        let fraction = _mm256_srli_epi32(bits, 23 - FRAC_BITS as i32);
+        let truncated_pow_2_4 = _mm256_permutevar8x32_ps(lookup_table_truncated_pow_2_4, fraction);
+        let x = _mm256_mul_ps(
+            x,
+            _mm256_permutevar8x32_ps(lookup_table_inv_truncated, fraction),
+        );
+
+        let x2 = _mm256_mul_ps(x, x);
+        let x3 = _mm256_mul_ps(x2, x);
+        let est = sum_mult_avx!(
+            (7.0 / 125.0),
+            (x, -36. / 125.),
+            (x2, 126. / 125.),
+            (x3, 28. / 125.)
+        );
+
+        _mm256_mul_ps(est, _mm256_mul_ps(truncated_pow_2_4, exp_pow_2_4))
+    }
 }
