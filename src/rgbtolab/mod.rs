@@ -189,6 +189,21 @@ mod avx2 {
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
 
+    macro_rules! lookup_table_8_avx2 {
+        (start: $start:expr, closure: $closure:expr) => {
+            _mm256_setr_ps(
+                $closure($start + 0),
+                $closure($start + 1),
+                $closure($start + 2),
+                $closure($start + 3),
+                $closure($start + 4),
+                $closure($start + 5),
+                $closure($start + 6),
+                $closure($start + 7),
+            )
+        };
+    }
+
     macro_rules! sum_mult_avx {
         (($init:expr), $(($vec:expr, $mul:expr)),* ) => {
             {
@@ -206,25 +221,7 @@ mod avx2 {
 
     #[target_feature(enable = "avx2")]
     pub unsafe fn rgb_to_lab_avx2(rgb: &[__m256; 3]) -> [Lab; 8] {
-        //xyz_to_lab_avx2(rgb_to_xyz_avx2(rgb))
-        let xyz = rgb_to_xyz_avx2(rgb);
-        #[target_feature(enable = "avx2")]
-        unsafe fn to_array(reg: __m256) -> [f32; 8] {
-            std::mem::transmute(reg)
-        }
-        let x = to_array(xyz[0]);
-        let y = to_array(xyz[1]);
-        let z = to_array(xyz[2]);
-
-        let mut output = [Lab {
-            l: 0.,
-            a: 0.,
-            b: 0.,
-        }; 8];
-        for i in 0..8 {
-            output[i] = xyz_to_lab([x[i], y[i], z[i]]);
-        }
-        output
+        xyz_to_lab_avx2(rgb_to_xyz_avx2(rgb))
     }
 
     #[target_feature(enable = "avx2")]
@@ -264,6 +261,55 @@ mod avx2 {
         _mm256_blendv_ps(low, hi, select)
     }
 
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn xyz_to_lab_avx2(xyz: [__m256; 3]) -> [Lab; 8] {
+        let x = xyz_to_lab_map_avx2(_mm256_mul_ps(xyz[0], _mm256_set1_ps(1.0 / 0.95047)));
+        let y = xyz_to_lab_map_avx2(xyz[1]);
+        let z = xyz_to_lab_map_avx2(_mm256_mul_ps(xyz[2], _mm256_set1_ps(1.0 / 1.08883)));
+
+        let l = _mm256_sub_ps(_mm256_mul_ps(_mm256_set1_ps(116.0), y), _mm256_set1_ps(16.0));
+        let a = _mm256_mul_ps(_mm256_sub_ps(x, y), _mm256_set1_ps(500.0));
+        let b = _mm256_mul_ps(_mm256_sub_ps(y, z), _mm256_set1_ps(200.0));
+
+        #[target_feature(enable = "avx2")]
+        unsafe fn to_array(reg: __m256) -> [f32; 8] {
+            std::mem::transmute(reg)
+        }
+        let l = to_array(l);
+        let a = to_array(a);
+        let b = to_array(b);
+
+        let mut output = [Lab {
+            l: 0.,
+            a: 0.,
+            b: 0.,
+        }; 8];
+        for i in 0..8 {
+            output[i] = Lab {
+                l: l[i],
+                a: a[i],
+                b: b[i],
+            };
+        }
+        output
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn xyz_to_lab_map_avx2(c: __m256) -> __m256 {
+        let low = _mm256_mul_ps(
+            _mm256_add_ps(
+                _mm256_mul_ps(c, _mm256_set1_ps(KAPPA)),
+                _mm256_set1_ps(16.0),
+            ),
+            _mm256_set1_ps(1.0 / 116.0),
+        );
+        let hi = cbrt_approx_avx2(c);
+        let select = _mm256_cmp_ps(c, _mm256_set1_ps(EPSILON), _CMP_GT_OS);
+        _mm256_blendv_ps(low, hi, select)
+    }
+
     #[target_feature(enable = "avx2")]
     unsafe fn pow_2_4_avx2(x: __m256) -> __m256 {
         // See non-avx2 version
@@ -277,16 +323,8 @@ mod avx2 {
 
         let lookup_entry_exp_pow_2_4 =
             |log2: i32| (f32::from_bits(((log2 + 0x7f) << 23) as u32) as f64).powf(2.4) as f32;
-        let lookup_table_exp_pow_2_4 = _mm256_setr_ps(
-            lookup_entry_exp_pow_2_4(-4),
-            lookup_entry_exp_pow_2_4(-3),
-            lookup_entry_exp_pow_2_4(-2),
-            lookup_entry_exp_pow_2_4(-1),
-            lookup_entry_exp_pow_2_4(0),
-            lookup_entry_exp_pow_2_4(1),
-            lookup_entry_exp_pow_2_4(2),
-            lookup_entry_exp_pow_2_4(3),
-        );
+        let lookup_table_exp_pow_2_4 =
+            lookup_table_8_avx2!(start: -4, closure: lookup_entry_exp_pow_2_4);
 
         let exp_pow_2_4 = _mm256_permutevar8x32_ps(lookup_table_exp_pow_2_4, log2_index);
 
@@ -302,28 +340,12 @@ mod avx2 {
             let truncated = 1.0 + (fraction as f64 + 0.5) / ((1 << FRAC_BITS) as f64);
             (1.0 / truncated) as f32
         };
-        let lookup_table_inv_truncated = _mm256_setr_ps(
-            lookup_entry_inv_truncated(0),
-            lookup_entry_inv_truncated(1),
-            lookup_entry_inv_truncated(2),
-            lookup_entry_inv_truncated(3),
-            lookup_entry_inv_truncated(4),
-            lookup_entry_inv_truncated(5),
-            lookup_entry_inv_truncated(6),
-            lookup_entry_inv_truncated(7),
-        );
+        let lookup_table_inv_truncated =
+            lookup_table_8_avx2!(start: 0, closure: lookup_entry_inv_truncated);
         let lookup_entry_truncated_pow_2_4 =
             |fraction: i32| (lookup_entry_inv_truncated(fraction) as f64).powf(-2.4) as f32;
-        let lookup_table_truncated_pow_2_4 = _mm256_setr_ps(
-            lookup_entry_truncated_pow_2_4(0),
-            lookup_entry_truncated_pow_2_4(1),
-            lookup_entry_truncated_pow_2_4(2),
-            lookup_entry_truncated_pow_2_4(3),
-            lookup_entry_truncated_pow_2_4(4),
-            lookup_entry_truncated_pow_2_4(5),
-            lookup_entry_truncated_pow_2_4(6),
-            lookup_entry_truncated_pow_2_4(7),
-        );
+        let lookup_table_truncated_pow_2_4 =
+            lookup_table_8_avx2!(start: 0, closure: lookup_entry_truncated_pow_2_4);
 
         // No reason to mask the higher bits
         let fraction = _mm256_srli_epi32(bits, 23 - FRAC_BITS as i32);
@@ -343,5 +365,60 @@ mod avx2 {
         );
 
         _mm256_mul_ps(est, _mm256_mul_ps(truncated_pow_2_4, exp_pow_2_4))
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn cbrt_approx_avx2(x: __m256) -> __m256 {
+        // See non-avx2 version
+
+        const FRAC_BITS: u32 = 3;
+
+        let bits = _mm256_castps_si256(x);
+
+        let log2_index =
+            _mm256_add_epi32(_mm256_srli_epi32(bits, 23), _mm256_set1_epi32(-0x7f + 7));
+
+        let lookup_entry_exp_cbrt =
+            |log2: i32| (f32::from_bits(((log2 + 0x7f) << 23) as u32) as f64).powf(1. / 3.) as f32;
+        let lookup_table_exp_cbrt = lookup_table_8_avx2!(start: -7, closure: lookup_entry_exp_cbrt);
+
+        let exp_cbrt = _mm256_permutevar8x32_ps(lookup_table_exp_cbrt, log2_index);
+
+        let x = _mm256_or_ps(
+            _mm256_and_ps(
+                x,
+                _mm256_castsi256_ps(_mm256_set1_epi32(0x807fffffu32 as i32)),
+            ),
+            _mm256_castsi256_ps(_mm256_set1_epi32(0x3f800000)),
+        );
+        let lookup_entry_inv_truncated = |fraction: i32| {
+            let truncated = 1.0 + (fraction as f64 + 0.5) / ((1 << FRAC_BITS) as f64);
+            (1.0 / truncated) as f32
+        };
+        let lookup_table_inv_truncated =
+            lookup_table_8_avx2!(start: 0, closure: lookup_entry_inv_truncated);
+        let lookup_entry_truncated_cbrt =
+            |fraction: i32| (lookup_entry_inv_truncated(fraction) as f64).powf(-1. / 3.) as f32;
+        let lookup_table_truncated_cbrt =
+            lookup_table_8_avx2!(start: 0, closure: lookup_entry_truncated_cbrt);
+
+        // No reason to mask the higher bits
+        let fraction = _mm256_srli_epi32(bits, 23 - FRAC_BITS as i32);
+        let truncated_cbrt = _mm256_permutevar8x32_ps(lookup_table_truncated_cbrt, fraction);
+        let x = _mm256_mul_ps(
+            x,
+            _mm256_permutevar8x32_ps(lookup_table_inv_truncated, fraction),
+        );
+
+        let x2 = _mm256_mul_ps(x, x);
+        let x3 = _mm256_mul_ps(x2, x);
+        let est = sum_mult_avx!(
+            (40. / 81.0),
+            (x, 60. / 81.),
+            (x2, -24. / 81.),
+            (x3, 5. / 81.)
+        );
+
+        _mm256_mul_ps(est, _mm256_mul_ps(truncated_cbrt, exp_cbrt))
     }
 }
