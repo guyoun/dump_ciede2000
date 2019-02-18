@@ -51,10 +51,25 @@ fn xyz_to_lab(xyz: [f32; 3]) -> Lab {
 #[inline]
 fn xyz_to_lab_map(c: f32) -> f32 {
     if c > EPSILON {
-        c.powf(1.0 / 3.0)
+        cbrt_approx(c)
     } else {
         (KAPPA * c + 16.0) * (1.0 / 116.0)
     }
+}
+
+macro_rules! lookup_table_8 {
+    (start: $start:expr, closure: $closure:expr) => {
+        [
+            $closure($start + 0),
+            $closure($start + 1),
+            $closure($start + 2),
+            $closure($start + 3),
+            $closure($start + 4),
+            $closure($start + 5),
+            $closure($start + 6),
+            $closure($start + 7),
+        ]
+    };
 }
 
 fn pow_2_4(x: f32) -> f32 {
@@ -79,16 +94,7 @@ fn pow_2_4(x: f32) -> f32 {
     // x^2.4 = (2^log2)^2.4 * (x/(2^log2))^2.4
     let lookup_entry_exp_pow_2_4 =
         |log2: i32| (f32::from_bits(((log2 + 0x7f) << 23) as u32) as f64).powf(2.4) as f32;
-    let lookup_table_exp_pow_2_4 = [
-        lookup_entry_exp_pow_2_4(-4),
-        lookup_entry_exp_pow_2_4(-3),
-        lookup_entry_exp_pow_2_4(-2),
-        lookup_entry_exp_pow_2_4(-1),
-        lookup_entry_exp_pow_2_4(0),
-        lookup_entry_exp_pow_2_4(1),
-        lookup_entry_exp_pow_2_4(2),
-        lookup_entry_exp_pow_2_4(3),
-    ];
+    let lookup_table_exp_pow_2_4 = lookup_table_8!(start: -4, closure: lookup_entry_exp_pow_2_4);
     let exp_pow_2_4 = lookup_table_exp_pow_2_4[(log2 + 4) as usize];
 
     // Zero the exponent of x or divide by 2^log.
@@ -100,28 +106,11 @@ fn pow_2_4(x: f32) -> f32 {
         let truncated = 1.0 + (fraction as f64 + 0.5) / ((1 << FRAC_BITS) as f64);
         (1.0 / truncated) as f32
     };
-    let lookup_table_inv_truncated = [
-        lookup_entry_inv_truncated(0),
-        lookup_entry_inv_truncated(1),
-        lookup_entry_inv_truncated(2),
-        lookup_entry_inv_truncated(3),
-        lookup_entry_inv_truncated(4),
-        lookup_entry_inv_truncated(5),
-        lookup_entry_inv_truncated(6),
-        lookup_entry_inv_truncated(7),
-    ];
+    let lookup_table_inv_truncated = lookup_table_8!(start: 0, closure: lookup_entry_inv_truncated);
     let lookup_entry_truncated_pow_2_4 =
         |fraction: i32| (lookup_entry_inv_truncated(fraction) as f64).powf(-2.4) as f32;
-    let lookup_table_truncated_pow_2_4 = [
-        lookup_entry_truncated_pow_2_4(0),
-        lookup_entry_truncated_pow_2_4(1),
-        lookup_entry_truncated_pow_2_4(2),
-        lookup_entry_truncated_pow_2_4(3),
-        lookup_entry_truncated_pow_2_4(4),
-        lookup_entry_truncated_pow_2_4(5),
-        lookup_entry_truncated_pow_2_4(6),
-        lookup_entry_truncated_pow_2_4(7),
-    ];
+    let lookup_table_truncated_pow_2_4 =
+        lookup_table_8!(start: 0, closure: lookup_entry_truncated_pow_2_4);
 
     // Expose only FRAC_BITS of the fraction.
     let fraction = (bits >> (23 - FRAC_BITS) & ((1 << FRAC_BITS) - 1)) as usize;
@@ -135,6 +124,57 @@ fn pow_2_4(x: f32) -> f32 {
     let est = 7. / 125. - 36. / 125. * x + 126. / 125. * x.powi(2) + 28. / 125. * x.powi(3);
 
     est * (truncated_pow_2_4 * exp_pow_2_4)
+}
+
+fn cbrt_approx(x: f32) -> f32 {
+    // Closely approximate x^(1/3).
+    // Divide x by its exponent and a truncated version of itself to get it as close to 1 as
+    // possible. Calculate the power of 1/3 using the binomial method. Multiply what was divided to
+    // the power of 1/3.
+
+    // Lookup tables still have to be hardcoded.
+    const FRAC_BITS: u32 = 3;
+
+    // Cast x into an integer to manipulate its exponent and fractional parts into indexes for
+    // lookup tables.
+    let bits = x.to_bits();
+
+    // Get the integer log2 from the exponent part of bits
+    let log2 = (bits >> 23) as i32 - 0x7f;
+
+    // x is always > EPSILON so we only have to deal with a limited range in the exponent.
+    // log2 range is [-7, 0]
+    // Use a lookup table to offset for dividing by 2^log of x.
+    // x^(1/3) = (2^log2)^(1/3) * (x/(2^log2))^(1/3)
+    let lookup_entry_exp_cbrt =
+        |log2: i32| (f32::from_bits(((log2 + 0x7f) << 23) as u32) as f64).powf(1. / 3.) as f32;
+    let lookup_table_exp_cbrt = lookup_table_8!(start: -7, closure: lookup_entry_exp_cbrt);
+    let exp_pow_cbrt = lookup_table_exp_cbrt[(log2 + 7) as usize];
+
+    // Zero the exponent of x or divide by 2^log.
+    let x = f32::from_bits((bits & 0x807fffff) | 0x3f800000);
+
+    // Use lookup tables to divide by a truncated version of x and get an offset for that division.
+    // x^(1/3) = a^(1/3) * (x/a)^(1/3)
+    let lookup_entry_inv_truncated = |fraction: i32| {
+        let truncated = 1.0 + (fraction as f64 + 0.5) / ((1 << FRAC_BITS) as f64);
+        (1.0 / truncated) as f32
+    };
+    let lookup_table_inv_truncated = lookup_table_8!(start: 0, closure: lookup_entry_inv_truncated);
+    let lookup_entry_truncated_cbrt =
+        |fraction: i32| (lookup_entry_inv_truncated(fraction) as f64).powf(-1. / 3.) as f32;
+    let lookup_table_truncated_cbrt =
+        lookup_table_8!(start: 0, closure: lookup_entry_truncated_cbrt);
+
+    // Expose only FRAC_BITS of the fraction.
+    let fraction = (bits >> (23 - FRAC_BITS) & ((1 << FRAC_BITS) - 1)) as usize;
+    let truncated_pow_cbrt = lookup_table_truncated_cbrt[fraction];
+    let x = x * lookup_table_inv_truncated[fraction];
+
+    // Binomial series
+    let est = 40. / 81. + 60. / 81. * x - 24. / 81. * x.powi(2) + 5. / 81. * x.powi(3);
+
+    est * (truncated_pow_cbrt * exp_pow_cbrt)
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
