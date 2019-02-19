@@ -164,8 +164,10 @@ fn main() {
                         * (delta_e_vec.iter().map(|x| *x as f64).sum::<f64>()
                             / ((width * height) as f64))
                             .log10();
-                println!("{:08}: {:2.4}", num_frames, score);
                 total += score;
+                if !cli.summary {
+                    println!("{:08}: {:2.4}", num_frames, score);
+                }
                 num_frames += 1;
                 if let Some(limit) = cli.limit {
                     if num_frames >= limit {
