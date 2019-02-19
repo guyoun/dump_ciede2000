@@ -64,9 +64,10 @@ fn parse_cli() -> CliOptions {
         )
         .arg(
             Arg::with_name("LIMIT")
-                .help("Only output the summary line")
+                .help("Maximum number of frames to process")
                 .short("l")
-                .long("limit"),
+                .long("limit")
+                .takes_value(true),
         )
         .arg(
             Arg::with_name("SUMMARY")
