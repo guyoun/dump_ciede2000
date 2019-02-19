@@ -6,6 +6,12 @@ use std::f32::consts::PI;
 
 pub struct DE2000;
 
+pub struct KSubArgs {
+    pub l: f32,
+    pub c: f32,
+    pub h: f32,
+}
+
 impl DE2000 {
     /// Returns the difference between two `Lab` colors.
     ///
@@ -36,11 +42,7 @@ impl DE2000 {
     /// }
     /// ```
 
-    pub fn new(color_1: Lab, color_2: Lab) -> f32 {
-        let ksub_l = 0.65;
-        let ksub_c = 1.0;
-        let ksub_h = 4.0;
-
+    pub fn new(color_1: Lab, color_2: Lab, ksub: KSubArgs) -> f32 {
         let delta_l_prime = color_2.l - color_1.l;
 
         let l_bar = (color_1.l + color_2.l) / 2.0;
@@ -86,11 +88,11 @@ impl DE2000 {
 
         let r_sub_t = get_r_sub_t(c_bar_prime, upcase_h_bar_prime);
 
-        let lightness: f32 = delta_l_prime / (ksub_l * s_sub_l);
+        let lightness: f32 = delta_l_prime / (ksub.l * s_sub_l);
 
-        let chroma: f32 = delta_c_prime / (ksub_c * s_sub_c);
+        let chroma: f32 = delta_c_prime / (ksub.c * s_sub_c);
 
-        let hue: f32 = delta_upcase_h_prime / (ksub_h * s_sub_upcase_h);
+        let hue: f32 = delta_upcase_h_prime / (ksub.h * s_sub_upcase_h);
 
         (lightness.powi(2) + chroma.powi(2) + hue.powi(2) + r_sub_t * chroma * hue).sqrt()
     }

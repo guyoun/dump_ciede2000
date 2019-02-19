@@ -166,6 +166,16 @@ fn main() {
     println!("Total: {:2.4}", total / (num_frames as f64));
 }
 
+// Arguments for delta e
+// "Color Image Quality Assessment Based on CIEDE2000"
+// Yang Yang, Jun Ming and Nenghai Yu, 2012
+// http://dx.doi.org/10.1155/2012/273723
+const K_SUB: KSubArgs = KSubArgs {
+    l: 0.65,
+    c: 1.0,
+    h: 4.0,
+};
+
 struct FrameRow<'a> {
     y: &'a [u8],
     u: &'a [u8],
@@ -206,7 +216,7 @@ fn delta_e_row_scalar(row1: FrameRow, row2: FrameRow, res_row: &mut [f32]) {
 
         let (r1, g1, b1) = yuv_to_rgb(*y1 as f32, *u1 as f32, *v1 as f32);
         let (r2, g2, b2) = yuv_to_rgb(*y2 as f32, *u2 as f32, *v2 as f32);
-        *res = DE2000::new(rgb_to_lab(&[r1, g1, b1]), rgb_to_lab(&[r2, g2, b2]));
+        *res = DE2000::new(rgb_to_lab(&[r1, g1, b1]), rgb_to_lab(&[r2, g2, b2]), K_SUB);
     }
 }
 
@@ -274,7 +284,7 @@ unsafe fn delta_e_row_avx2(row1: FrameRow, row2: FrameRow, res_row: &mut [f32]) 
             let lab1 = rgb_to_lab_avx2(&[r1, g1, b1]);
             let lab2 = rgb_to_lab_avx2(&[r2, g2, b2]);
             for i in 0..8 {
-                res_chunk[i] = DE2000::new(lab1[i], lab2[i]);
+                res_chunk[i] = DE2000::new(lab1[i], lab2[i], K_SUB);
             }
         } else {
             delta_e_row_scalar(
