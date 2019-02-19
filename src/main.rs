@@ -79,7 +79,9 @@ fn parse_cli() -> CliOptions {
         input1: Box::new(File::open(matches.value_of("video1").unwrap()).unwrap()) as Box<dyn Read>,
         input2: Box::new(File::open(matches.value_of("video2").unwrap()).unwrap()) as Box<dyn Read>,
         summary: matches.is_present("SUMMARY"),
-        limit: matches.value_of("LIMIT").map(|v| v.parse().expect("Limit must be a positive number")),
+        limit: matches
+            .value_of("LIMIT")
+            .map(|v| v.parse().expect("Limit must be a positive number")),
     }
 }
 

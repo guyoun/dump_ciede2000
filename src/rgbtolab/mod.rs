@@ -268,7 +268,10 @@ mod avx2 {
         let y = xyz_to_lab_map_avx2(xyz[1]);
         let z = xyz_to_lab_map_avx2(_mm256_mul_ps(xyz[2], _mm256_set1_ps(1.0 / 1.08883)));
 
-        let l = _mm256_sub_ps(_mm256_mul_ps(_mm256_set1_ps(116.0), y), _mm256_set1_ps(16.0));
+        let l = _mm256_sub_ps(
+            _mm256_mul_ps(_mm256_set1_ps(116.0), y),
+            _mm256_set1_ps(16.0),
+        );
         let a = _mm256_mul_ps(_mm256_sub_ps(x, y), _mm256_set1_ps(500.0));
         let b = _mm256_mul_ps(_mm256_sub_ps(y, z), _mm256_set1_ps(200.0));
 
