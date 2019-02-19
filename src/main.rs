@@ -46,6 +46,7 @@ pub struct CliOptions {
     pub input1: Box<dyn Read>,
     pub input2: Box<dyn Read>,
     pub summary: bool,
+    pub limit: Option<usize>,
 }
 
 fn parse_cli() -> CliOptions {
@@ -62,6 +63,12 @@ fn parse_cli() -> CliOptions {
                 .required(true),
         )
         .arg(
+            Arg::with_name("LIMIT")
+                .help("Only output the summary line")
+                .short("l")
+                .long("limit"),
+        )
+        .arg(
             Arg::with_name("SUMMARY")
                 .help("Only output the summary line")
                 .short("s")
@@ -72,6 +79,7 @@ fn parse_cli() -> CliOptions {
         input1: Box::new(File::open(matches.value_of("video1").unwrap()).unwrap()) as Box<dyn Read>,
         input2: Box::new(File::open(matches.value_of("video2").unwrap()).unwrap()) as Box<dyn Read>,
         summary: matches.is_present("SUMMARY"),
+        limit: matches.value_of("LIMIT").map(|v| v.parse().expect("Limit must be a positive number")),
     }
 }
 
@@ -157,6 +165,11 @@ fn main() {
                 println!("{:08}: {:2.4}", num_frames, score);
                 total += score;
                 num_frames += 1;
+                if let Some(limit) = cli.limit {
+                    if num_frames >= limit {
+                        break;
+                    }
+                }
             }
             _ => {
                 break;
