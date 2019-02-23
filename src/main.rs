@@ -194,7 +194,7 @@ const K_SUB: KSubArgs = KSubArgs {
     h: 4.0,
 };
 
-struct FrameRow<'a> {
+pub struct FrameRow<'a> {
     y: &'a [u8],
     u: &'a [u8],
     v: &'a [u8],
@@ -210,6 +210,24 @@ fn delta_e_row(row1: FrameRow, row2: FrameRow, res_row: &mut [f32]) {
     delta_e_row_scalar(row1, row2, res_row);
 }
 
+fn delta_e_scalar(yuv1: (u16, u16, u16), yuv2: (u16, u16, u16)) -> f32 {
+    let yuv_to_rgb = |yuv: (u16, u16, u16)| {
+        let y = (yuv.0 as f32 - 16.) * (1. / 219.);
+        let u = (yuv.1 as f32 - 128.) * (1. / 224.);
+        let v = (yuv.2 as f32 - 128.) * (1. / 224.);
+
+        let r = y + 1.28033 * v;
+        let g = y - 0.21482 * u - 0.38059 * v;
+        let b = y + 2.12798 * u;
+
+        (r, g, b)
+    };
+
+    let (r1, g1, b1) = yuv_to_rgb(yuv1);
+    let (r2, g2, b2) = yuv_to_rgb(yuv2);
+    DE2000::new(rgb_to_lab(&[r1, g1, b1]), rgb_to_lab(&[r2, g2, b2]), K_SUB)
+}
+
 fn delta_e_row_scalar(row1: FrameRow, row2: FrameRow, res_row: &mut [f32]) {
     for (y1, u1, v1, y2, u2, v2, res) in izip!(
         row1.y,
@@ -220,104 +238,113 @@ fn delta_e_row_scalar(row1: FrameRow, row2: FrameRow, res_row: &mut [f32]) {
         row2.v.iter().interleave(row2.v.iter()),
         res_row
     ) {
-        let yuv_to_rgb = |y: f32, u: f32, v: f32| {
-            let y = (y - 16.) * (1. / 219.);
-            let u = (u - 128.) * (1. / 224.);
-            let v = (v - 128.) * (1. / 224.);
-
-            let r = y + 1.28033 * v;
-            let g = y - 0.21482 * u - 0.38059 * v;
-            let b = y + 2.12798 * u;
-
-            (r, g, b)
-        };
-
-        let (r1, g1, b1) = yuv_to_rgb(*y1 as f32, *u1 as f32, *v1 as f32);
-        let (r2, g2, b2) = yuv_to_rgb(*y2 as f32, *u2 as f32, *v2 as f32);
-        *res = DE2000::new(rgb_to_lab(&[r1, g1, b1]), rgb_to_lab(&[r2, g2, b2]), K_SUB);
+        *res = delta_e_scalar(
+            (*y1 as u16, *u1 as u16, *v1 as u16),
+            (*y2 as u16, *u2 as u16, *v2 as u16),
+        );
     }
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2")]
-unsafe fn delta_e_row_avx2(row1: FrameRow, row2: FrameRow, res_row: &mut [f32]) {
+use self::avx2::*;
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+mod avx2 {
+    use super::*;
+
     #[cfg(target_arch = "x86")]
     use std::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
 
-    for (chunk1_y, chunk1_u, chunk1_v, chunk2_y, chunk2_u, chunk2_v, res_chunk) in izip!(
-        row1.y.chunks(8),
-        row1.u.chunks(4),
-        row1.v.chunks(4),
-        row2.y.chunks(8),
-        row2.u.chunks(4),
-        row2.v.chunks(4),
-        res_row.chunks_mut(8)
+    #[target_feature(enable = "avx2")]
+    unsafe fn delta_e_avx2(
+        yuv1: (__m256, __m256, __m256),
+        yuv2: (__m256, __m256, __m256),
+        res_chunk: &mut [f32],
     ) {
-        if chunk1_y.len() == 8 {
+        #[target_feature(enable = "avx2")]
+        unsafe fn yuv_to_rgb(yuv: (__m256, __m256, __m256)) -> (__m256, __m256, __m256) {
             #[target_feature(enable = "avx2")]
-            unsafe fn load_luma(chunk: &[u8]) -> __m256 {
-                let tmp = _mm_loadl_epi64(chunk.as_ptr() as *const _);
-                _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(tmp))
+            unsafe fn set1(val: f32) -> __m256 {
+                _mm256_set1_ps(val)
             };
+            let y = _mm256_mul_ps(_mm256_sub_ps(yuv.0, set1(16.)), set1(1. / 219.));
+            let u = _mm256_mul_ps(_mm256_sub_ps(yuv.1, set1(128.)), set1(1. / 224.));
+            let v = _mm256_mul_ps(_mm256_sub_ps(yuv.2, set1(128.)), set1(1. / 224.));
 
-            #[target_feature(enable = "avx2")]
-            unsafe fn load_chroma(chunk: &[u8]) -> __m256 {
-                let tmp = _mm_cvtsi32_si128(*(chunk.as_ptr() as *const i32));
-                _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_unpacklo_epi8(tmp, tmp)))
-            };
+            let r = _mm256_add_ps(y, _mm256_mul_ps(v, set1(1.28033)));
+            let g = _mm256_add_ps(
+                _mm256_add_ps(y, _mm256_mul_ps(u, set1(-0.21482))),
+                _mm256_mul_ps(v, set1(-0.38059)),
+            );
+            let b = _mm256_add_ps(y, _mm256_mul_ps(u, set1(2.12798)));
 
-            #[target_feature(enable = "avx2")]
-            unsafe fn yuv_to_rgb(y: __m256, u: __m256, v: __m256) -> (__m256, __m256, __m256) {
+            (r, g, b)
+        };
+
+        let (r1, g1, b1) = yuv_to_rgb(yuv1);
+        let (r2, g2, b2) = yuv_to_rgb(yuv2);
+
+        let lab1 = rgb_to_lab_avx2(&[r1, g1, b1]);
+        let lab2 = rgb_to_lab_avx2(&[r2, g2, b2]);
+        for i in 0..8 {
+            res_chunk[i] = DE2000::new(lab1[i], lab2[i], K_SUB);
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn delta_e_row_avx2(row1: FrameRow, row2: FrameRow, res_row: &mut [f32]) {
+        for (chunk1_y, chunk1_u, chunk1_v, chunk2_y, chunk2_u, chunk2_v, res_chunk) in izip!(
+            row1.y.chunks(8),
+            row1.u.chunks(4),
+            row1.v.chunks(4),
+            row2.y.chunks(8),
+            row2.u.chunks(4),
+            row2.v.chunks(4),
+            res_row.chunks_mut(8)
+        ) {
+            if chunk1_y.len() == 8 {
                 #[target_feature(enable = "avx2")]
-                unsafe fn set1(val: f32) -> __m256 {
-                    _mm256_set1_ps(val)
+                unsafe fn load_luma(chunk: &[u8]) -> __m256 {
+                    let tmp = _mm_loadl_epi64(chunk.as_ptr() as *const _);
+                    _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(tmp))
                 };
-                let y = _mm256_mul_ps(_mm256_sub_ps(y, set1(16.)), set1(1. / 219.));
-                let u = _mm256_mul_ps(_mm256_sub_ps(u, set1(128.)), set1(1. / 224.));
-                let v = _mm256_mul_ps(_mm256_sub_ps(v, set1(128.)), set1(1. / 224.));
 
-                let r = _mm256_add_ps(y, _mm256_mul_ps(v, set1(1.28033)));
-                let g = _mm256_add_ps(
-                    _mm256_add_ps(y, _mm256_mul_ps(u, set1(-0.21482))),
-                    _mm256_mul_ps(v, set1(-0.38059)),
+                #[target_feature(enable = "avx2")]
+                unsafe fn load_chroma(chunk: &[u8]) -> __m256 {
+                    let tmp = _mm_cvtsi32_si128(*(chunk.as_ptr() as *const i32));
+                    _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_unpacklo_epi8(tmp, tmp)))
+                };
+
+                delta_e_avx2(
+                    (
+                        load_luma(chunk1_y),
+                        load_chroma(chunk1_u),
+                        load_chroma(chunk1_v),
+                    ),
+                    (
+                        load_luma(chunk2_y),
+                        load_chroma(chunk2_u),
+                        load_chroma(chunk2_v),
+                    ),
+                    res_chunk,
                 );
-                let b = _mm256_add_ps(y, _mm256_mul_ps(u, set1(2.12798)));
-
-                (r, g, b)
-            };
-
-            let (r1, g1, b1) = yuv_to_rgb(
-                load_luma(chunk1_y),
-                load_chroma(chunk1_u),
-                load_chroma(chunk1_v),
-            );
-            let (r2, g2, b2) = yuv_to_rgb(
-                load_luma(chunk2_y),
-                load_chroma(chunk2_u),
-                load_chroma(chunk2_v),
-            );
-
-            let lab1 = rgb_to_lab_avx2(&[r1, g1, b1]);
-            let lab2 = rgb_to_lab_avx2(&[r2, g2, b2]);
-            for i in 0..8 {
-                res_chunk[i] = DE2000::new(lab1[i], lab2[i], K_SUB);
+            } else {
+                delta_e_row_scalar(
+                    FrameRow {
+                        y: chunk1_y,
+                        u: chunk1_u,
+                        v: chunk1_v,
+                    },
+                    FrameRow {
+                        y: chunk2_y,
+                        u: chunk2_u,
+                        v: chunk2_v,
+                    },
+                    res_chunk,
+                );
             }
-        } else {
-            delta_e_row_scalar(
-                FrameRow {
-                    y: chunk1_y,
-                    u: chunk1_u,
-                    v: chunk1_v,
-                },
-                FrameRow {
-                    y: chunk2_y,
-                    u: chunk2_u,
-                    v: chunk2_v,
-                },
-                res_chunk,
-            );
         }
     }
 }
