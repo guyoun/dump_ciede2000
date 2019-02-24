@@ -42,11 +42,12 @@ use rgbtolab::*;
 mod delta_e;
 use delta_e::*;
 
-pub struct CliOptions {
+struct CliOptions {
     pub input1: Box<dyn Read>,
     pub input2: Box<dyn Read>,
     pub summary: bool,
     pub limit: Option<usize>,
+    pub simd: bool,
 }
 
 fn parse_cli() -> CliOptions {
@@ -75,6 +76,13 @@ fn parse_cli() -> CliOptions {
                 .short("s")
                 .long("summary"),
         )
+        .arg(
+            Arg::with_name("SIMD")
+                .help("Set simd feature level")
+                .long("simd")
+                .takes_value(true)
+                .possible_values(&["off", "native"]),
+        )
         .get_matches();
     CliOptions {
         input1: Box::new(File::open(matches.value_of("video1").unwrap()).unwrap()) as Box<dyn Read>,
@@ -83,6 +91,11 @@ fn parse_cli() -> CliOptions {
         limit: matches
             .value_of("LIMIT")
             .map(|v| v.parse().expect("Limit must be a positive number")),
+        simd: match matches.value_of("SIMD") {
+            Some("off") => false,
+            Some("native") | None => true,
+            Some(&_) => unreachable!(),
+        },
     }
 }
 
@@ -155,6 +168,7 @@ fn main() {
                                     v: &v_plane2[(i >> 1) * (width >> 1)..][..width >> 1],
                                 },
                                 &mut delta_e_vec[i * width..][..width],
+                                cli.simd,
                             );
                         }
                         _ => {}
@@ -200,10 +214,10 @@ pub struct FrameRow<'a> {
     v: &'a [u8],
 }
 
-fn delta_e_row(row1: FrameRow, row2: FrameRow, res_row: &mut [f32]) {
+fn delta_e_row(row1: FrameRow, row2: FrameRow, res_row: &mut [f32], simd: bool) {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        if is_x86_feature_detected!("avx2") {
+        if is_x86_feature_detected!("avx2") && simd {
             return unsafe { delta_e_row_avx2(row1, row2, res_row) };
         }
     }
