@@ -156,23 +156,21 @@ fn main() {
                 let v_plane2 = pic2.get_v_plane();
                 for i in 0..height {
                     match bytewidth {
-                        1 => {
-                            unsafe {
-                                 delta_e_row_fn(
-                                    FrameRow {
-                                        y: &y_plane1[i * width..][..width],
-                                        u: &u_plane1[(i >> 1) * (width >> 1)..][..width >> 1],
-                                        v: &v_plane1[(i >> 1) * (width >> 1)..][..width >> 1],
-                                    },
-                                    FrameRow {
-                                        y: &y_plane2[i * width..][..width],
-                                        u: &u_plane2[(i >> 1) * (width >> 1)..][..width >> 1],
-                                        v: &v_plane2[(i >> 1) * (width >> 1)..][..width >> 1],
-                                    },
-                                    &mut delta_e_vec[i * width..][..width],
-                                );
-                            }
-                        }
+                        1 => unsafe {
+                            delta_e_row_fn(
+                                FrameRow {
+                                    y: &y_plane1[i * width..][..width],
+                                    u: &u_plane1[(i >> 1) * (width >> 1)..][..width >> 1],
+                                    v: &v_plane1[(i >> 1) * (width >> 1)..][..width >> 1],
+                                },
+                                FrameRow {
+                                    y: &y_plane2[i * width..][..width],
+                                    u: &u_plane2[(i >> 1) * (width >> 1)..][..width >> 1],
+                                    v: &v_plane2[(i >> 1) * (width >> 1)..][..width >> 1],
+                                },
+                                &mut delta_e_vec[i * width..][..width],
+                            );
+                        },
                         _ => {}
                     }
                 }
@@ -199,7 +197,6 @@ fn main() {
     }
     println!("Total: {:2.4}", total / (num_frames as f64));
 }
-
 
 // Arguments for delta e
 // "Color Image Quality Assessment Based on CIEDE2000"
