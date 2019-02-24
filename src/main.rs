@@ -141,6 +141,7 @@ fn main() {
 
     //let y_stride = width * bytewidth;
     let sample_max = (1 << bit_depth) - 1;
+    let delta_e_row_fn = get_delta_e_row_fn(cli.simd);
     let mut num_frames: usize = 0;
     let mut total: f64 = 0f64;
     loop {
@@ -156,20 +157,21 @@ fn main() {
                 for i in 0..height {
                     match bytewidth {
                         1 => {
-                            delta_e_row(
-                                FrameRow {
-                                    y: &y_plane1[i * width..][..width],
-                                    u: &u_plane1[(i >> 1) * (width >> 1)..][..width >> 1],
-                                    v: &v_plane1[(i >> 1) * (width >> 1)..][..width >> 1],
-                                },
-                                FrameRow {
-                                    y: &y_plane2[i * width..][..width],
-                                    u: &u_plane2[(i >> 1) * (width >> 1)..][..width >> 1],
-                                    v: &v_plane2[(i >> 1) * (width >> 1)..][..width >> 1],
-                                },
-                                &mut delta_e_vec[i * width..][..width],
-                                cli.simd,
-                            );
+                            unsafe {
+                                 delta_e_row_fn(
+                                    FrameRow {
+                                        y: &y_plane1[i * width..][..width],
+                                        u: &u_plane1[(i >> 1) * (width >> 1)..][..width >> 1],
+                                        v: &v_plane1[(i >> 1) * (width >> 1)..][..width >> 1],
+                                    },
+                                    FrameRow {
+                                        y: &y_plane2[i * width..][..width],
+                                        u: &u_plane2[(i >> 1) * (width >> 1)..][..width >> 1],
+                                        v: &v_plane2[(i >> 1) * (width >> 1)..][..width >> 1],
+                                    },
+                                    &mut delta_e_vec[i * width..][..width],
+                                );
+                            }
                         }
                         _ => {}
                     }
@@ -198,6 +200,7 @@ fn main() {
     println!("Total: {:2.4}", total / (num_frames as f64));
 }
 
+
 // Arguments for delta e
 // "Color Image Quality Assessment Based on CIEDE2000"
 // Yang Yang, Jun Ming and Nenghai Yu, 2012
@@ -214,14 +217,16 @@ pub struct FrameRow<'a> {
     v: &'a [u8],
 }
 
-fn delta_e_row(row1: FrameRow, row2: FrameRow, res_row: &mut [f32], simd: bool) {
+type DeltaERowFn = unsafe fn(FrameRow, FrameRow, &mut [f32]);
+
+fn get_delta_e_row_fn(simd: bool) -> DeltaERowFn {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if is_x86_feature_detected!("avx2") && simd {
-            return unsafe { delta_e_row_avx2(row1, row2, res_row) };
+            return delta_e_row_avx2;
         }
     }
-    delta_e_row_scalar(row1, row2, res_row);
+    delta_e_row_scalar
 }
 
 fn delta_e_scalar(yuv1: (u16, u16, u16), yuv2: (u16, u16, u16)) -> f32 {
@@ -242,7 +247,7 @@ fn delta_e_scalar(yuv1: (u16, u16, u16), yuv2: (u16, u16, u16)) -> f32 {
     DE2000::new(rgb_to_lab(&[r1, g1, b1]), rgb_to_lab(&[r2, g2, b2]), K_SUB)
 }
 
-fn delta_e_row_scalar(row1: FrameRow, row2: FrameRow, res_row: &mut [f32]) {
+unsafe fn delta_e_row_scalar(row1: FrameRow, row2: FrameRow, res_row: &mut [f32]) {
     for (y1, u1, v1, y2, u2, v2, res) in izip!(
         row1.y,
         row1.u.iter().interleave(row1.u.iter()),
