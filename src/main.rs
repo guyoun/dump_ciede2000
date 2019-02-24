@@ -28,7 +28,6 @@ extern crate clap;
 
 #[macro_use]
 extern crate itertools;
-use itertools::Itertools;
 
 use clap::{App, Arg, ArgMatches};
 use std::fs::File;
@@ -139,9 +138,11 @@ fn main() {
         }
     }
 
-    //let y_stride = width * bytewidth;
-    let sample_max = (1 << bit_depth) - 1;
-    let delta_e_row_fn = get_delta_e_row_fn(cli.simd);
+    // luma stride
+    let y_stride = width * bytewidth;
+    // chroma stride
+    let c_stride = (width >> 1) * bytewidth;
+    let delta_e_row_fn = get_delta_e_row_fn(bit_depth, cli.simd);
     let mut num_frames: usize = 0;
     let mut total: f64 = 0f64;
     loop {
@@ -155,23 +156,20 @@ fn main() {
                 let u_plane2 = pic2.get_u_plane();
                 let v_plane2 = pic2.get_v_plane();
                 for i in 0..height {
-                    match bytewidth {
-                        1 => unsafe {
-                            delta_e_row_fn(
-                                FrameRow {
-                                    y: &y_plane1[i * width..][..width],
-                                    u: &u_plane1[(i >> 1) * (width >> 1)..][..width >> 1],
-                                    v: &v_plane1[(i >> 1) * (width >> 1)..][..width >> 1],
-                                },
-                                FrameRow {
-                                    y: &y_plane2[i * width..][..width],
-                                    u: &u_plane2[(i >> 1) * (width >> 1)..][..width >> 1],
-                                    v: &v_plane2[(i >> 1) * (width >> 1)..][..width >> 1],
-                                },
-                                &mut delta_e_vec[i * width..][..width],
-                            );
-                        },
-                        _ => {}
+                    unsafe {
+                        delta_e_row_fn(
+                            FrameRow {
+                                y: &y_plane1[i * y_stride..][..y_stride],
+                                u: &u_plane1[(i >> 1) * c_stride..][..c_stride],
+                                v: &v_plane1[(i >> 1) * c_stride..][..c_stride],
+                            },
+                            FrameRow {
+                                y: &y_plane2[i * y_stride..][..y_stride],
+                                u: &u_plane2[(i >> 1) * c_stride..][..c_stride],
+                                v: &v_plane2[(i >> 1) * c_stride..][..c_stride],
+                            },
+                            &mut delta_e_vec[i * width..][..width],
+                        );
                     }
                 }
                 let score = 45.
@@ -216,21 +214,28 @@ pub struct FrameRow<'a> {
 
 type DeltaERowFn = unsafe fn(FrameRow, FrameRow, &mut [f32]);
 
-fn get_delta_e_row_fn(simd: bool) -> DeltaERowFn {
+fn get_delta_e_row_fn(bit_depth: usize, simd: bool) -> DeltaERowFn {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        if is_x86_feature_detected!("avx2") && simd {
+        if is_x86_feature_detected!("avx2") && simd && bit_depth == 8 {
             return delta_e_row_avx2;
         }
     }
-    delta_e_row_scalar
+    match bit_depth {
+        8 => delta_e_row_scalar,
+        10 => delta_e_row_scalar_hbd10,
+        12 => delta_e_row_scalar_hbd12,
+        _ => unreachable!(),
+    }
 }
 
-fn delta_e_scalar(yuv1: (u16, u16, u16), yuv2: (u16, u16, u16)) -> f32 {
+fn delta_e_scalar(yuv1: (u16, u16, u16), yuv2: (u16, u16, u16), bit_depth: u32) -> f32 {
+    let scale = (1 << (bit_depth - 8)) as f32;
     let yuv_to_rgb = |yuv: (u16, u16, u16)| {
-        let y = (yuv.0 as f32 - 16.) * (1. / 219.);
-        let u = (yuv.1 as f32 - 128.) * (1. / 224.);
-        let v = (yuv.2 as f32 - 128.) * (1. / 224.);
+        // Assumes BT.709
+        let y = (yuv.0 as f32 - 16. * scale) * (1. / (219. * scale));
+        let u = (yuv.1 as f32 - 128. * scale) * (1. / (224. * scale));
+        let v = (yuv.2 as f32 - 128. * scale) * (1. / (224. * scale));
 
         let r = y + 1.28033 * v;
         let g = y - 0.21482 * u - 0.38059 * v;
@@ -244,21 +249,58 @@ fn delta_e_scalar(yuv1: (u16, u16, u16), yuv2: (u16, u16, u16)) -> f32 {
     DE2000::new(rgb_to_lab(&[r1, g1, b1]), rgb_to_lab(&[r2, g2, b2]), K_SUB)
 }
 
+fn twice<T>(
+    i: T,
+) -> itertools::Interleave<<T as IntoIterator>::IntoIter, <T as IntoIterator>::IntoIter>
+where
+    T: IntoIterator + Clone,
+{
+    itertools::interleave(i.clone(), i)
+}
+
 unsafe fn delta_e_row_scalar(row1: FrameRow, row2: FrameRow, res_row: &mut [f32]) {
     for (y1, u1, v1, y2, u2, v2, res) in izip!(
         row1.y,
-        row1.u.iter().interleave(row1.u.iter()),
-        row1.v.iter().interleave(row1.v.iter()),
+        twice(row1.u),
+        twice(row1.v),
         row2.y,
-        row2.u.iter().interleave(row2.u.iter()),
-        row2.v.iter().interleave(row2.v.iter()),
+        twice(row2.u),
+        twice(row2.v),
         res_row
     ) {
         *res = delta_e_scalar(
             (*y1 as u16, *u1 as u16, *v1 as u16),
             (*y2 as u16, *u2 as u16, *v2 as u16),
+            8,
         );
     }
+}
+
+fn delta_e_row_scalar_hbd(row1: FrameRow, row2: FrameRow, res_row: &mut [f32], bit_depth: u32) {
+    for (y1, u1, v1, y2, u2, v2, res) in izip!(
+        row1.y.chunks(2),
+        twice(row1.u.chunks(2)),
+        twice(row1.v.chunks(2)),
+        row2.y.chunks(2),
+        twice(row2.u.chunks(2)),
+        twice(row2.v.chunks(2)),
+        res_row
+    ) {
+        let to_u16 = |input: &[u8]| -> u16 { ((input[1] as u16) << 8) | (input[0] as u16) };
+        *res = delta_e_scalar(
+            (to_u16(&*y1), to_u16(&*u1), to_u16(&*v1)),
+            (to_u16(&*y2), to_u16(&*u2), to_u16(&*v2)),
+            bit_depth,
+        );
+    }
+}
+
+unsafe fn delta_e_row_scalar_hbd10(row1: FrameRow, row2: FrameRow, res_row: &mut [f32]) {
+    delta_e_row_scalar_hbd(row1, row2, res_row, 10)
+}
+
+unsafe fn delta_e_row_scalar_hbd12(row1: FrameRow, row2: FrameRow, res_row: &mut [f32]) {
+    delta_e_row_scalar_hbd(row1, row2, res_row, 12)
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
