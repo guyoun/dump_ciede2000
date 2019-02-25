@@ -80,7 +80,8 @@ fn parse_cli() -> CliOptions {
                 .help("Set simd feature level")
                 .long("simd")
                 .takes_value(true)
-                .possible_values(&["off", "native"]),
+                .possible_values(&["off", "native"])
+                .default_value("native"),
         )
         .get_matches();
     CliOptions {
@@ -90,10 +91,10 @@ fn parse_cli() -> CliOptions {
         limit: matches
             .value_of("LIMIT")
             .map(|v| v.parse().expect("Limit must be a positive number")),
-        simd: match matches.value_of("SIMD") {
-            Some("off") => false,
-            Some("native") | None => true,
-            Some(&_) => unreachable!(),
+        simd: match matches.value_of("SIMD").unwrap() {
+            "off" => false,
+            "native" => true,
+            &_ => unreachable!(),
         },
     }
 }
