@@ -218,36 +218,39 @@ type DeltaERowFn = unsafe fn(FrameRow, FrameRow, &mut [f32]);
 fn get_delta_e_row_fn(bit_depth: usize, simd: bool) -> DeltaERowFn {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        if is_x86_feature_detected!("avx2") && simd && bit_depth == 8 {
-            return delta_e_row_avx2;
+        if is_x86_feature_detected!("avx2") && simd {
+            return match bit_depth {
+                8 => BD8::delta_e_row_avx2,
+                10 => BD10::delta_e_row_avx2,
+                12 => BD12::delta_e_row_avx2,
+                _ => unreachable!(),
+            };
         }
     }
     match bit_depth {
-        8 => delta_e_row_scalar,
-        10 => delta_e_row_scalar_hbd10,
-        12 => delta_e_row_scalar_hbd12,
+        8 => BD8::delta_e_row_scalar,
+        10 => BD10::delta_e_row_scalar,
+        12 => BD12::delta_e_row_scalar,
         _ => unreachable!(),
     }
 }
 
-fn delta_e_scalar(yuv1: (u16, u16, u16), yuv2: (u16, u16, u16), bit_depth: u32) -> f32 {
-    let scale = (1 << (bit_depth - 8)) as f32;
-    let yuv_to_rgb = |yuv: (u16, u16, u16)| {
-        // Assumes BT.709
-        let y = (yuv.0 as f32 - 16. * scale) * (1. / (219. * scale));
-        let u = (yuv.1 as f32 - 128. * scale) * (1. / (224. * scale));
-        let v = (yuv.2 as f32 - 128. * scale) * (1. / (224. * scale));
+pub trait BitDepth {
+    const BIT_DEPTH: u32;
+}
 
-        let r = y + 1.28033 * v;
-        let g = y - 0.21482 * u - 0.38059 * v;
-        let b = y + 2.12798 * u;
+struct BD8;
+struct BD10;
+struct BD12;
 
-        (r, g, b)
-    };
-
-    let (r1, g1, b1) = yuv_to_rgb(yuv1);
-    let (r2, g2, b2) = yuv_to_rgb(yuv2);
-    DE2000::new(rgb_to_lab(&[r1, g1, b1]), rgb_to_lab(&[r2, g2, b2]), K_SUB)
+impl BitDepth for BD8 {
+    const BIT_DEPTH: u32 = 8;
+}
+impl BitDepth for BD10 {
+    const BIT_DEPTH: u32 = 10;
+}
+impl BitDepth for BD12 {
+    const BIT_DEPTH: u32 = 12;
 }
 
 fn twice<T>(
@@ -259,50 +262,66 @@ where
     itertools::interleave(i.clone(), i)
 }
 
-unsafe fn delta_e_row_scalar(row1: FrameRow, row2: FrameRow, res_row: &mut [f32]) {
-    for (y1, u1, v1, y2, u2, v2, res) in izip!(
-        row1.y,
-        twice(row1.u),
-        twice(row1.v),
-        row2.y,
-        twice(row2.u),
-        twice(row2.v),
-        res_row
-    ) {
-        *res = delta_e_scalar(
-            (*y1 as u16, *u1 as u16, *v1 as u16),
-            (*y2 as u16, *u2 as u16, *v2 as u16),
-            8,
-        );
+pub trait DeltaEScalar: BitDepth {
+    fn delta_e_scalar(yuv1: (u16, u16, u16), yuv2: (u16, u16, u16)) -> f32 {
+        let scale = (1 << (Self::BIT_DEPTH - 8)) as f32;
+        let yuv_to_rgb = |yuv: (u16, u16, u16)| {
+            // Assumes BT.709
+            let y = (yuv.0 as f32 - 16. * scale) * (1. / (219. * scale));
+            let u = (yuv.1 as f32 - 128. * scale) * (1. / (224. * scale));
+            let v = (yuv.2 as f32 - 128. * scale) * (1. / (224. * scale));
+
+            let r = y + 1.28033 * v;
+            let g = y - 0.21482 * u - 0.38059 * v;
+            let b = y + 2.12798 * u;
+
+            (r, g, b)
+        };
+
+        let (r1, g1, b1) = yuv_to_rgb(yuv1);
+        let (r2, g2, b2) = yuv_to_rgb(yuv2);
+        DE2000::new(rgb_to_lab(&[r1, g1, b1]), rgb_to_lab(&[r2, g2, b2]), K_SUB)
+    }
+
+    unsafe fn delta_e_row_scalar(row1: FrameRow, row2: FrameRow, res_row: &mut [f32]) {
+        // Only one version should be compiled for each trait
+        if Self::BIT_DEPTH == 8 {
+            for (y1, u1, v1, y2, u2, v2, res) in izip!(
+                row1.y,
+                twice(row1.u),
+                twice(row1.v),
+                row2.y,
+                twice(row2.u),
+                twice(row2.v),
+                res_row
+            ) {
+                *res = Self::delta_e_scalar(
+                    (*y1 as u16, *u1 as u16, *v1 as u16),
+                    (*y2 as u16, *u2 as u16, *v2 as u16),
+                );
+            }
+        } else {
+            for (y1, u1, v1, y2, u2, v2, res) in izip!(
+                row1.y.chunks(2),
+                twice(row1.u.chunks(2)),
+                twice(row1.v.chunks(2)),
+                row2.y.chunks(2),
+                twice(row2.u.chunks(2)),
+                twice(row2.v.chunks(2)),
+                res_row
+            ) {
+                let to_u16 = |input: &[u8]| -> u16 { ((input[1] as u16) << 8) | (input[0] as u16) };
+                *res = Self::delta_e_scalar(
+                    (to_u16(&*y1), to_u16(&*u1), to_u16(&*v1)),
+                    (to_u16(&*y2), to_u16(&*u2), to_u16(&*v2)),
+                );
+            }
+        }
     }
 }
-
-fn delta_e_row_scalar_hbd(row1: FrameRow, row2: FrameRow, res_row: &mut [f32], bit_depth: u32) {
-    for (y1, u1, v1, y2, u2, v2, res) in izip!(
-        row1.y.chunks(2),
-        twice(row1.u.chunks(2)),
-        twice(row1.v.chunks(2)),
-        row2.y.chunks(2),
-        twice(row2.u.chunks(2)),
-        twice(row2.v.chunks(2)),
-        res_row
-    ) {
-        let to_u16 = |input: &[u8]| -> u16 { ((input[1] as u16) << 8) | (input[0] as u16) };
-        *res = delta_e_scalar(
-            (to_u16(&*y1), to_u16(&*u1), to_u16(&*v1)),
-            (to_u16(&*y2), to_u16(&*u2), to_u16(&*v2)),
-            bit_depth,
-        );
-    }
-}
-
-unsafe fn delta_e_row_scalar_hbd10(row1: FrameRow, row2: FrameRow, res_row: &mut [f32]) {
-    delta_e_row_scalar_hbd(row1, row2, res_row, 10)
-}
-
-unsafe fn delta_e_row_scalar_hbd12(row1: FrameRow, row2: FrameRow, res_row: &mut [f32]) {
-    delta_e_row_scalar_hbd(row1, row2, res_row, 12)
-}
+impl DeltaEScalar for BD8 {}
+impl DeltaEScalar for BD10 {}
+impl DeltaEScalar for BD12 {}
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use self::avx2::*;
@@ -316,21 +335,26 @@ mod avx2 {
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
 
-    #[target_feature(enable = "avx2")]
-    unsafe fn delta_e_avx2(
-        yuv1: (__m256, __m256, __m256),
-        yuv2: (__m256, __m256, __m256),
-        res_chunk: &mut [f32],
-    ) {
+    pub trait DeltaEAVX2: BitDepth + DeltaEScalar {
         #[target_feature(enable = "avx2")]
         unsafe fn yuv_to_rgb(yuv: (__m256, __m256, __m256)) -> (__m256, __m256, __m256) {
+            let scale: f32 = (1 << (Self::BIT_DEPTH - 8)) as f32;
             #[target_feature(enable = "avx2")]
             unsafe fn set1(val: f32) -> __m256 {
                 _mm256_set1_ps(val)
             };
-            let y = _mm256_mul_ps(_mm256_sub_ps(yuv.0, set1(16.)), set1(1. / 219.));
-            let u = _mm256_mul_ps(_mm256_sub_ps(yuv.1, set1(128.)), set1(1. / 224.));
-            let v = _mm256_mul_ps(_mm256_sub_ps(yuv.2, set1(128.)), set1(1. / 224.));
+            let y = _mm256_mul_ps(
+                _mm256_sub_ps(yuv.0, set1(16. * scale)),
+                set1(1. / (219. * scale)),
+            );
+            let u = _mm256_mul_ps(
+                _mm256_sub_ps(yuv.1, set1(128. * scale)),
+                set1(1. / (224. * scale)),
+            );
+            let v = _mm256_mul_ps(
+                _mm256_sub_ps(yuv.2, set1(128. * scale)),
+                set1(1. / (224. * scale)),
+            );
 
             let r = _mm256_add_ps(y, _mm256_mul_ps(v, set1(1.28033)));
             let g = _mm256_add_ps(
@@ -340,70 +364,136 @@ mod avx2 {
             let b = _mm256_add_ps(y, _mm256_mul_ps(u, set1(2.12798)));
 
             (r, g, b)
-        };
-
-        let (r1, g1, b1) = yuv_to_rgb(yuv1);
-        let (r2, g2, b2) = yuv_to_rgb(yuv2);
-
-        let lab1 = rgb_to_lab_avx2(&[r1, g1, b1]);
-        let lab2 = rgb_to_lab_avx2(&[r2, g2, b2]);
-        for i in 0..8 {
-            res_chunk[i] = DE2000::new(lab1[i], lab2[i], K_SUB);
         }
-    }
 
-    #[target_feature(enable = "avx2")]
-    pub unsafe fn delta_e_row_avx2(row1: FrameRow, row2: FrameRow, res_row: &mut [f32]) {
-        for (chunk1_y, chunk1_u, chunk1_v, chunk2_y, chunk2_u, chunk2_v, res_chunk) in izip!(
-            row1.y.chunks(8),
-            row1.u.chunks(4),
-            row1.v.chunks(4),
-            row2.y.chunks(8),
-            row2.u.chunks(4),
-            row2.v.chunks(4),
-            res_row.chunks_mut(8)
+        #[target_feature(enable = "avx2")]
+        unsafe fn delta_e_avx2(
+            yuv1: (__m256, __m256, __m256),
+            yuv2: (__m256, __m256, __m256),
+            res_chunk: &mut [f32],
         ) {
-            if chunk1_y.len() == 8 {
-                #[target_feature(enable = "avx2")]
-                unsafe fn load_luma(chunk: &[u8]) -> __m256 {
-                    let tmp = _mm_loadl_epi64(chunk.as_ptr() as *const _);
-                    _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(tmp))
-                };
+            let (r1, g1, b1) = Self::yuv_to_rgb(yuv1);
+            let (r2, g2, b2) = Self::yuv_to_rgb(yuv2);
 
-                #[target_feature(enable = "avx2")]
-                unsafe fn load_chroma(chunk: &[u8]) -> __m256 {
-                    let tmp = _mm_cvtsi32_si128(*(chunk.as_ptr() as *const i32));
-                    _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_unpacklo_epi8(tmp, tmp)))
-                };
+            let lab1 = rgb_to_lab_avx2(&[r1, g1, b1]);
+            let lab2 = rgb_to_lab_avx2(&[r2, g2, b2]);
+            for i in 0..8 {
+                res_chunk[i] = DE2000::new(lab1[i], lab2[i], K_SUB);
+            }
+        }
 
-                delta_e_avx2(
-                    (
-                        load_luma(chunk1_y),
-                        load_chroma(chunk1_u),
-                        load_chroma(chunk1_v),
-                    ),
-                    (
-                        load_luma(chunk2_y),
-                        load_chroma(chunk2_u),
-                        load_chroma(chunk2_v),
-                    ),
-                    res_chunk,
-                );
+        #[target_feature(enable = "avx2")]
+        unsafe fn delta_e_row_avx2(row1: FrameRow, row2: FrameRow, res_row: &mut [f32]) {
+            // Only one version should be compiled for each trait
+            if Self::BIT_DEPTH == 8 {
+                for (chunk1_y, chunk1_u, chunk1_v, chunk2_y, chunk2_u, chunk2_v, res_chunk) in izip!(
+                    row1.y.chunks(8),
+                    row1.u.chunks(4),
+                    row1.v.chunks(4),
+                    row2.y.chunks(8),
+                    row2.u.chunks(4),
+                    row2.v.chunks(4),
+                    res_row.chunks_mut(8)
+                ) {
+                    if chunk1_y.len() == 8 {
+                        #[target_feature(enable = "avx2")]
+                        unsafe fn load_luma(chunk: &[u8]) -> __m256 {
+                            let tmp = _mm_loadl_epi64(chunk.as_ptr() as *const _);
+                            _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(tmp))
+                        };
+
+                        #[target_feature(enable = "avx2")]
+                        unsafe fn load_chroma(chunk: &[u8]) -> __m256 {
+                            let tmp = _mm_cvtsi32_si128(*(chunk.as_ptr() as *const i32));
+                            _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_unpacklo_epi8(tmp, tmp)))
+                        };
+
+                        Self::delta_e_avx2(
+                            (
+                                load_luma(chunk1_y),
+                                load_chroma(chunk1_u),
+                                load_chroma(chunk1_v),
+                            ),
+                            (
+                                load_luma(chunk2_y),
+                                load_chroma(chunk2_u),
+                                load_chroma(chunk2_v),
+                            ),
+                            res_chunk,
+                        );
+                    } else {
+                        Self::delta_e_row_scalar(
+                            FrameRow {
+                                y: chunk1_y,
+                                u: chunk1_u,
+                                v: chunk1_v,
+                            },
+                            FrameRow {
+                                y: chunk2_y,
+                                u: chunk2_u,
+                                v: chunk2_v,
+                            },
+                            res_chunk,
+                        );
+                    }
+                }
             } else {
-                delta_e_row_scalar(
-                    FrameRow {
-                        y: chunk1_y,
-                        u: chunk1_u,
-                        v: chunk1_v,
-                    },
-                    FrameRow {
-                        y: chunk2_y,
-                        u: chunk2_u,
-                        v: chunk2_v,
-                    },
-                    res_chunk,
-                );
+                for (chunk1_y, chunk1_u, chunk1_v, chunk2_y, chunk2_u, chunk2_v, res_chunk) in izip!(
+                    row1.y.chunks(16),
+                    row1.u.chunks(8),
+                    row1.v.chunks(8),
+                    row2.y.chunks(16),
+                    row2.u.chunks(8),
+                    row2.v.chunks(8),
+                    res_row.chunks_mut(8)
+                ) {
+                    if chunk1_y.len() == 16 {
+                        #[target_feature(enable = "avx2")]
+                        unsafe fn load_luma(chunk: &[u8]) -> __m256 {
+                            let tmp = _mm_loadu_si128(chunk.as_ptr() as *const _);
+                            _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(tmp))
+                        };
+
+                        #[target_feature(enable = "avx2")]
+                        unsafe fn load_chroma(chunk: &[u8]) -> __m256 {
+                            let tmp = _mm_loadl_epi64(chunk.as_ptr() as *const _);
+                            _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm_unpacklo_epi16(tmp, tmp)))
+                        };
+
+                        Self::delta_e_avx2(
+                            (
+                                load_luma(chunk1_y),
+                                load_chroma(chunk1_u),
+                                load_chroma(chunk1_v),
+                            ),
+                            (
+                                load_luma(chunk2_y),
+                                load_chroma(chunk2_u),
+                                load_chroma(chunk2_v),
+                            ),
+                            res_chunk,
+                        );
+                    } else {
+                        Self::delta_e_row_scalar(
+                            FrameRow {
+                                y: chunk1_y,
+                                u: chunk1_u,
+                                v: chunk1_v,
+                            },
+                            FrameRow {
+                                y: chunk2_y,
+                                u: chunk2_u,
+                                v: chunk2_v,
+                            },
+                            res_chunk,
+                        );
+                    }
+                }
             }
         }
     }
+
+    impl DeltaEAVX2 for BD8 {}
+    impl DeltaEAVX2 for BD10 {}
+    impl DeltaEAVX2 for BD12 {}
 }
