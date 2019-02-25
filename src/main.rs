@@ -29,7 +29,7 @@ extern crate clap;
 #[macro_use]
 extern crate itertools;
 
-use clap::{App, Arg, ArgMatches};
+use clap::{App, Arg};
 use std::fs::File;
 use std::io::prelude::*;
 
