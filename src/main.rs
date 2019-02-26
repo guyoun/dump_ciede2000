@@ -83,6 +83,12 @@ fn parse_cli() -> CliOptions {
                 .possible_values(&["off", "native"])
                 .default_value("native"),
         )
+        .arg(
+            Arg::with_name("THREADS")
+                .help("Set threadpool size (unimplemented)")
+                .long("threads")
+                .takes_value(true),
+        )
         .get_matches();
     CliOptions {
         input1: Box::new(File::open(matches.value_of("video1").unwrap()).unwrap()) as Box<dyn Read>,
