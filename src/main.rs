@@ -99,6 +99,29 @@ fn parse_cli() -> CliOptions {
     }
 }
 
+// Taken from rav1e
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum ChromaSampling {
+    Cs420,
+    Cs422,
+    Cs444,
+    Cs400,
+}
+
+// Taken from rav1e
+fn map_y4m_color_space(color_space: y4m::Colorspace) -> ChromaSampling {
+    use y4m::Colorspace::*;
+    use ChromaSampling::*;
+    match color_space {
+        Cmono => Cs400,
+        C420jpeg | C420paldv => Cs420,
+        C420mpeg2 => Cs420,
+        C420 | C420p10 | C420p12 => Cs420,
+        C422 | C422p10 | C422p12 => Cs422,
+        C444 | C444p10 | C444p12 => Cs444,
+    }
+}
+
 fn main() {
     let mut cli = parse_cli();
     let mut video1 = y4m::decode(&mut cli.input1).unwrap();
@@ -116,17 +139,34 @@ fn main() {
         }
         dimension1
     };
-    let (bit_depth, bytewidth) = {
-        /*let colorspace1 = video1.get_colorspace();
-        let colorspace2 = video2.get_colorspace();*/
-        let bit_depth1 = video1.get_bit_depth();
-        let bit_depth2 = video2.get_bit_depth();
+    let (bit_depth, bytewidth, xdec, ydec) = {
+        let colorspace1 = video1.get_colorspace();
+        let colorspace2 = video2.get_colorspace();
+        let bit_depth1 = colorspace1.get_bit_depth();
+        let bit_depth2 = colorspace2.get_bit_depth();
         if bit_depth1 != bit_depth2 {
             eprintln!("Bit depths do not match: {} != {}", bit_depth1, bit_depth2);
             exit(1);
         }
-        // TODO: get and test chroma sampling
-        (bit_depth1, video1.get_bytes_per_sample())
+        let sampling1 = map_y4m_color_space(colorspace1);
+        let sampling2 = map_y4m_color_space(colorspace2);
+        if sampling1 != sampling2 {
+            eprintln!("Sub sampling does not match. Mismatched subsampling is not supported.");
+            exit(1);
+        }
+        if sampling1 == ChromaSampling::Cs400 {
+            eprintln!("Grayscale is unsupported.")
+        }
+        let (xdec, ydec) = {
+            use self::ChromaSampling::*;
+            match sampling1 {
+                Cs420 => (1, 1),
+                Cs422 => (1, 0),
+                Cs444 => (0, 0),
+                Cs400 => (1, 1),
+            }
+        };
+        (bit_depth1, video1.get_bytes_per_sample(), xdec, ydec)
     };
     {
         let framerate1 = video1.get_framerate();
@@ -142,8 +182,8 @@ fn main() {
     // luma stride
     let y_stride = width * bytewidth;
     // chroma stride
-    let c_stride = (width >> 1) * bytewidth;
-    let delta_e_row_fn = get_delta_e_row_fn(bit_depth, cli.simd);
+    let c_stride = (width >> xdec) * bytewidth;
+    let delta_e_row_fn = get_delta_e_row_fn(bit_depth, xdec, cli.simd);
     let mut num_frames: usize = 0;
     let mut total: f64 = 0f64;
     loop {
@@ -161,13 +201,13 @@ fn main() {
                         delta_e_row_fn(
                             FrameRow {
                                 y: &y_plane1[i * y_stride..][..y_stride],
-                                u: &u_plane1[(i >> 1) * c_stride..][..c_stride],
-                                v: &v_plane1[(i >> 1) * c_stride..][..c_stride],
+                                u: &u_plane1[(i >> ydec) * c_stride..][..c_stride],
+                                v: &v_plane1[(i >> ydec) * c_stride..][..c_stride],
                             },
                             FrameRow {
                                 y: &y_plane2[i * y_stride..][..y_stride],
-                                u: &u_plane2[(i >> 1) * c_stride..][..c_stride],
-                                v: &v_plane2[(i >> 1) * c_stride..][..c_stride],
+                                u: &u_plane2[(i >> ydec) * c_stride..][..c_stride],
+                                v: &v_plane2[(i >> ydec) * c_stride..][..c_stride],
                             },
                             &mut delta_e_vec[i * width..][..width],
                         );
@@ -215,10 +255,10 @@ pub struct FrameRow<'a> {
 
 type DeltaERowFn = unsafe fn(FrameRow, FrameRow, &mut [f32]);
 
-fn get_delta_e_row_fn(bit_depth: usize, simd: bool) -> DeltaERowFn {
+fn get_delta_e_row_fn(bit_depth: usize, xdec: usize, simd: bool) -> DeltaERowFn {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        if is_x86_feature_detected!("avx2") && simd {
+        if is_x86_feature_detected!("avx2") && xdec == 1 && simd {
             return match bit_depth {
                 8 => BD8::delta_e_row_avx2,
                 10 => BD10::delta_e_row_avx2,
@@ -227,30 +267,53 @@ fn get_delta_e_row_fn(bit_depth: usize, simd: bool) -> DeltaERowFn {
             };
         }
     }
-    match bit_depth {
-        8 => BD8::delta_e_row_scalar,
-        10 => BD10::delta_e_row_scalar,
-        12 => BD12::delta_e_row_scalar,
+    match (bit_depth, xdec) {
+        (8, 1) => BD8::delta_e_row_scalar,
+        (10, 1) => BD10::delta_e_row_scalar,
+        (12, 1) => BD12::delta_e_row_scalar,
+        (8, 0) => BD8_444::delta_e_row_scalar,
+        (10, 0) => BD10_444::delta_e_row_scalar,
+        (12, 0) => BD12_444::delta_e_row_scalar,
         _ => unreachable!(),
     }
 }
 
-pub trait BitDepth {
+pub trait Colorspace {
     const BIT_DEPTH: u32;
+    const X_DECIMATION: u32;
 }
 
 struct BD8;
 struct BD10;
 struct BD12;
 
-impl BitDepth for BD8 {
+struct BD8_444;
+struct BD10_444;
+struct BD12_444;
+
+impl Colorspace for BD8 {
     const BIT_DEPTH: u32 = 8;
+    const X_DECIMATION: u32 = 1;
 }
-impl BitDepth for BD10 {
+impl Colorspace for BD10 {
     const BIT_DEPTH: u32 = 10;
+    const X_DECIMATION: u32 = 1;
 }
-impl BitDepth for BD12 {
+impl Colorspace for BD12 {
     const BIT_DEPTH: u32 = 12;
+    const X_DECIMATION: u32 = 1;
+}
+impl Colorspace for BD8_444 {
+    const BIT_DEPTH: u32 = 8;
+    const X_DECIMATION: u32 = 0;
+}
+impl Colorspace for BD10_444 {
+    const BIT_DEPTH: u32 = 10;
+    const X_DECIMATION: u32 = 0;
+}
+impl Colorspace for BD12_444 {
+    const BIT_DEPTH: u32 = 12;
+    const X_DECIMATION: u32 = 0;
 }
 
 fn twice<T>(
@@ -262,7 +325,7 @@ where
     itertools::interleave(i.clone(), i)
 }
 
-pub trait DeltaEScalar: BitDepth {
+pub trait DeltaEScalar: Colorspace {
     fn delta_e_scalar(yuv1: (u16, u16, u16), yuv2: (u16, u16, u16)) -> f32 {
         let scale = (1 << (Self::BIT_DEPTH - 8)) as f32;
         let yuv_to_rgb = |yuv: (u16, u16, u16)| {
@@ -286,42 +349,77 @@ pub trait DeltaEScalar: BitDepth {
     unsafe fn delta_e_row_scalar(row1: FrameRow, row2: FrameRow, res_row: &mut [f32]) {
         // Only one version should be compiled for each trait
         if Self::BIT_DEPTH == 8 {
-            for (y1, u1, v1, y2, u2, v2, res) in izip!(
-                row1.y,
-                twice(row1.u),
-                twice(row1.v),
-                row2.y,
-                twice(row2.u),
-                twice(row2.v),
-                res_row
-            ) {
-                *res = Self::delta_e_scalar(
-                    (*y1 as u16, *u1 as u16, *v1 as u16),
-                    (*y2 as u16, *u2 as u16, *v2 as u16),
-                );
+            if Self::X_DECIMATION == 1 {
+                for (y1, u1, v1, y2, u2, v2, res) in izip!(
+                    row1.y,
+                    twice(row1.u),
+                    twice(row1.v),
+                    row2.y,
+                    twice(row2.u),
+                    twice(row2.v),
+                    res_row
+                ) {
+                    *res = Self::delta_e_scalar(
+                        (*y1 as u16, *u1 as u16, *v1 as u16),
+                        (*y2 as u16, *u2 as u16, *v2 as u16),
+                    );
+                }
+            } else {
+                for (y1, u1, v1, y2, u2, v2, res) in
+                    izip!(row1.y, row1.u, row1.v, row2.y, row2.u, row2.v, res_row)
+                {
+                    *res = Self::delta_e_scalar(
+                        (*y1 as u16, *u1 as u16, *v1 as u16),
+                        (*y2 as u16, *u2 as u16, *v2 as u16),
+                    );
+                }
             }
         } else {
-            for (y1, u1, v1, y2, u2, v2, res) in izip!(
-                row1.y.chunks(2),
-                twice(row1.u.chunks(2)),
-                twice(row1.v.chunks(2)),
-                row2.y.chunks(2),
-                twice(row2.u.chunks(2)),
-                twice(row2.v.chunks(2)),
-                res_row
-            ) {
-                let to_u16 = |input: &[u8]| -> u16 { ((input[1] as u16) << 8) | (input[0] as u16) };
-                *res = Self::delta_e_scalar(
-                    (to_u16(&*y1), to_u16(&*u1), to_u16(&*v1)),
-                    (to_u16(&*y2), to_u16(&*u2), to_u16(&*v2)),
-                );
+            if Self::X_DECIMATION == 1 {
+                for (y1, u1, v1, y2, u2, v2, res) in izip!(
+                    row1.y.chunks(2),
+                    twice(row1.u.chunks(2)),
+                    twice(row1.v.chunks(2)),
+                    row2.y.chunks(2),
+                    twice(row2.u.chunks(2)),
+                    twice(row2.v.chunks(2)),
+                    res_row
+                ) {
+                    let to_u16 =
+                        |input: &[u8]| -> u16 { ((input[1] as u16) << 8) | (input[0] as u16) };
+                    *res = Self::delta_e_scalar(
+                        (to_u16(&*y1), to_u16(&*u1), to_u16(&*v1)),
+                        (to_u16(&*y2), to_u16(&*u2), to_u16(&*v2)),
+                    );
+                }
+            } else {
+                for (y1, u1, v1, y2, u2, v2, res) in izip!(
+                    row1.y.chunks(2),
+                    row1.u.chunks(2),
+                    row1.v.chunks(2),
+                    row2.y.chunks(2),
+                    row2.u.chunks(2),
+                    row2.v.chunks(2),
+                    res_row
+                ) {
+                    let to_u16 =
+                        |input: &[u8]| -> u16 { ((input[1] as u16) << 8) | (input[0] as u16) };
+                    *res = Self::delta_e_scalar(
+                        (to_u16(&*y1), to_u16(&*u1), to_u16(&*v1)),
+                        (to_u16(&*y2), to_u16(&*u2), to_u16(&*v2)),
+                    );
+                }
             }
         }
     }
 }
+
 impl DeltaEScalar for BD8 {}
 impl DeltaEScalar for BD10 {}
 impl DeltaEScalar for BD12 {}
+impl DeltaEScalar for BD8_444 {}
+impl DeltaEScalar for BD10_444 {}
+impl DeltaEScalar for BD12_444 {}
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use self::avx2::*;
@@ -335,7 +433,7 @@ mod avx2 {
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
 
-    pub trait DeltaEAVX2: BitDepth + DeltaEScalar {
+    pub trait DeltaEAVX2: Colorspace + DeltaEScalar {
         #[target_feature(enable = "avx2")]
         unsafe fn yuv_to_rgb(yuv: (__m256, __m256, __m256)) -> (__m256, __m256, __m256) {
             let scale: f32 = (1 << (Self::BIT_DEPTH - 8)) as f32;
