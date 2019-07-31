@@ -344,7 +344,10 @@ pub trait DeltaEScalar: Colorspace {
             let g = y - 0.21482 * u - 0.38059 * v;
             let b = y + 2.12798 * u;
 
-            (r, g, b)
+            let clamp = |color: f32| {
+                color.max(0.).min(1.)
+            };
+            (clamp(r), clamp(g), clamp(b))
         };
 
         let (r1, g1, b1) = yuv_to_rgb(yuv1);
@@ -467,7 +470,12 @@ mod avx2 {
             );
             let b = _mm256_add_ps(y, _mm256_mul_ps(u, set1(2.12798)));
 
-            (r, g, b)
+            #[target_feature(enable = "avx2")]
+            unsafe fn clamp(color: __m256) -> __m256 {
+                _mm256_min_ps(_mm256_max_ps(color, _mm256_setzero_ps()), set1(1.))
+            }
+
+            (clamp(r), clamp(g), clamp(b))
         }
 
         #[target_feature(enable = "avx2")]
