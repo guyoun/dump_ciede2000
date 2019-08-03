@@ -72,6 +72,30 @@ macro_rules! lookup_table_8 {
     };
 }
 
+
+macro_rules! lookup_table_16 {
+    (start: $start:expr, closure: $closure:expr) => {
+        [
+            $closure($start + 0),
+            $closure($start + 1),
+            $closure($start + 2),
+            $closure($start + 3),
+            $closure($start + 4),
+            $closure($start + 5),
+            $closure($start + 6),
+            $closure($start + 7),
+            $closure($start + 8),
+            $closure($start + 9),
+            $closure($start + 10),
+            $closure($start + 11),
+            $closure($start + 12),
+            $closure($start + 13),
+            $closure($start + 14),
+            $closure($start + 15),
+        ]
+    };
+}
+
 fn pow_2_4(x: f32) -> f32 {
     // Closely approximate x^2.4.
     // Divide x by its exponent and a truncated version of itself to get it as close to 1 as
@@ -89,7 +113,7 @@ fn pow_2_4(x: f32) -> f32 {
     let log2 = (bits >> 23) as i32 - 0x7f;
 
     // x is always >= (10/255 + A)*D so we only have to deal with a limited range in the exponent.
-    // log2 range is [-4, 0]
+    // log2 range is [-4, 3]
     // Use a lookup table to offset for dividing by 2^log of x.
     // x^2.4 = (2^log2)^2.4 * (x/(2^log2))^2.4
     let lookup_entry_exp_pow_2_4 =
@@ -143,12 +167,12 @@ fn cbrt_approx(x: f32) -> f32 {
     let log2 = (bits >> 23) as i32 - 0x7f;
 
     // x is always > EPSILON so we only have to deal with a limited range in the exponent.
-    // log2 range is [-7, 0]
+    // log2 range is [-7, 8]
     // Use a lookup table to offset for dividing by 2^log of x.
     // x^(1/3) = (2^log2)^(1/3) * (x/(2^log2))^(1/3)
     let lookup_entry_exp_cbrt =
         |log2: i32| (f32::from_bits(((log2 + 0x7f) << 23) as u32) as f64).powf(1. / 3.) as f32;
-    let lookup_table_exp_cbrt = lookup_table_8!(start: -7, closure: lookup_entry_exp_cbrt);
+    let lookup_table_exp_cbrt = lookup_table_16!(start: -7, closure: lookup_entry_exp_cbrt);
     let exp_pow_cbrt = lookup_table_exp_cbrt[(log2 + 7) as usize];
 
     // Zero the exponent of x or divide by 2^log.
@@ -200,6 +224,15 @@ mod avx2 {
                 $closure($start + 5),
                 $closure($start + 6),
                 $closure($start + 7),
+            )
+        };
+    }
+
+    macro_rules! lookup_table_16_avx2 {
+        (start: $start:expr, closure: $closure:expr) => {
+            (
+                lookup_table_8_avx2!(start: $start, closure: $closure),
+                lookup_table_8_avx2!(start: $start + 8, closure: $closure)
             )
         };
     }
@@ -383,9 +416,14 @@ mod avx2 {
 
         let lookup_entry_exp_cbrt =
             |log2: i32| (f32::from_bits(((log2 + 0x7f) << 23) as u32) as f64).powf(1. / 3.) as f32;
-        let lookup_table_exp_cbrt = lookup_table_8_avx2!(start: -7, closure: lookup_entry_exp_cbrt);
+        let lookup_table_exp_cbrt = lookup_table_16_avx2!(start: -7, closure: lookup_entry_exp_cbrt);
 
-        let exp_cbrt = _mm256_permutevar8x32_ps(lookup_table_exp_cbrt, log2_index);
+        let exp_cbrt = _mm256_blendv_ps(
+            _mm256_permutevar8x32_ps(lookup_table_exp_cbrt.0, log2_index),
+            _mm256_permutevar8x32_ps(lookup_table_exp_cbrt.1, log2_index),
+            // Check if log is greater than 7
+            _mm256_castsi256_ps(_mm256_slli_epi32(log2_index, 28))
+        );
 
         let x = _mm256_or_ps(
             _mm256_and_ps(
